@@ -124,17 +124,21 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		// call, so a bare `ctx.invokeTool(params)` keeps the caller's `toolCall`/provider metadata
 		// (write/edit LSP batching, computer safety acknowledgement), stops when the outer call is
 		// aborted, and still streams native progress.
-		return this.registeredTool.definition.execute(
-			toolCallId,
-			params,
+		return this.runner.runExecution(
+			signal =>
+				this.registeredTool.definition.execute(
+					toolCallId,
+					params,
+					signal,
+					onUpdate,
+					this.runner.createContext(undefined, {
+						toolName: this.registeredTool.definition.name,
+						context,
+						signal,
+						onUpdate,
+					}),
+				),
 			signal,
-			onUpdate,
-			this.runner.createContext(undefined, {
-				toolName: this.registeredTool.definition.name,
-				context,
-				signal,
-				onUpdate,
-			}),
 		);
 	}
 }
@@ -231,7 +235,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		return target.restartForModeChange();
 	}
 
-	async execute(
+	execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<TDetails, TParameters>> {
+		return this.runner.runExecution(signal => this.#execute(toolCallId, params, signal, onUpdate, context), signal);
+	}
+
+	async #execute(
 		toolCallId: string,
 		params: Static<TParameters>,
 		signal?: AbortSignal,
@@ -502,10 +516,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// expose its settings to registered tools and any fallback handlers they
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
-			result = await this.runner.runScoped(() =>
-				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
-				),
+			result = await this.runner.runExecution(
+				signal =>
+					this.runner.runScoped(() =>
+						withFileMutationSession(this.runner.sessionId, () =>
+							this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+						),
+					),
+				signal,
 			);
 		} catch (err) {
 			executionError = toError(err);

@@ -497,6 +497,50 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(content).not.toContain("Run focused checks");
 	});
 
+	it("invalidates an armed goal timer across hold and release without changing the goal", async () => {
+		await harness.mode.handleGoalModeCommand("Keep working");
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		const held = await harness.session.executionHold.hold();
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+		await harness.session.executionHold.release(held);
+		vi.advanceTimersByTime(1600);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "explicit" }));
+		await waiter.inputPromise;
+	});
+
+	it("does not arm goal execution when a goal resumes while held", async () => {
+		await harness.mode.handleGoalModeCommand("Keep working");
+		await harness.session.goalRuntime.pauseGoal();
+		const held = await harness.session.executionHold.hold();
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		await harness.session.goalRuntime.resumeGoal();
+		await harness.session.executionHold.release(held);
+		vi.advanceTimersByTime(1600);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "explicit" }));
+		await waiter.inputPromise;
+	});
+
+	it("invalidates an armed loop timer across hold and release", async () => {
+		harness.mode.loopModeEnabled = true;
+		harness.mode.loopPrompt = "repeat";
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		const held = await harness.session.executionHold.hold();
+		await harness.session.executionHold.release(held);
+		vi.advanceTimersByTime(1600);
+		await waitForMicrotasks();
+		expect(waiter.getResolvedInput()).toBeUndefined();
+		harness.mode.disableLoopMode();
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "explicit" }));
+		await waiter.inputPromise;
+	});
+
 	it("drops a goal continuation tick while the agent is streaming", async () => {
 		// Repro for the race the streaming guard on /goal set X exposed: the
 		// 800ms continuation timer armed by getUserInput() can outlive the idle

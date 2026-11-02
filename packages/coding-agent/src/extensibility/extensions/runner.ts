@@ -45,6 +45,7 @@ import { createExtensionModelQuery } from "./model-api";
 import { trackUserWaits, type UserWaitTracker } from "./user-wait";
 import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import { extensionLinkClicksAvailable } from "@oh-my-pi/pi-tui/render/extension-links";
+import { execCommand } from "../../exec/exec";
 import type {
 	AfterProviderResponseEvent,
 	AssistantMessageRewriteEvent,
@@ -545,6 +546,36 @@ export class ExtensionRunner {
 	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
 	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
 	#sessionModes?: ExtensionContextActions["sessionModes"];
+	#executionHold?: ExtensionContextActions["executionHold"];
+	#ownedExecutions = new Map<Promise<unknown>, AbortController>();
+	#executionAdmissionGuard: (() => void) | undefined;
+
+	setExecutionAdmissionGuard(guard: () => void): void {
+		this.#executionAdmissionGuard = guard;
+	}
+
+	assertExecutionAllowed(): void {
+		this.#executionAdmissionGuard?.();
+		if (this.#executionHold && this.#executionHold.getState().status !== "open")
+			throw new Error("Session execution is held");
+	}
+
+	runExecution<T>(work: (signal: AbortSignal | undefined) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		this.assertExecutionAllowed();
+		if (!this.#executionAdmissionGuard && !this.#executionHold) return work(signal);
+		const controller = new AbortController();
+		const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+		const execution = work(combined);
+		this.#ownedExecutions.set(execution, controller);
+		void execution.finally(() => this.#ownedExecutions.delete(execution)).catch(() => {});
+		return execution;
+	}
+
+	async abortExecutionAndWait(): Promise<void> {
+		for (const controller of this.#ownedExecutions.values()) controller.abort();
+		await Promise.allSettled(this.#ownedExecutions.keys());
+	}
+
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
@@ -744,12 +775,16 @@ export class ExtensionRunner {
 			throw new Error(`invokeTool: delegation depth exceeded 8 (recursive invokeTool for "${name}"?)`);
 		}
 		const toolCallId = `invoke-${name}-${Date.now().toString(36)}-${depth}`;
-		return (await resolved.tool.execute(
-			toolCallId,
-			params as never,
+		return (await this.runExecution(
+			signal =>
+				resolved.tool.execute(
+					toolCallId,
+					params as never,
+					signal,
+					options?.onUpdate as never,
+					options?.callerContext ?? resolved.makeContext(),
+				),
 			options?.signal,
-			options?.onUpdate as never,
-			options?.callerContext ?? resolved.makeContext(),
 		)) as AgentToolResult<TDetails>;
 	}
 
@@ -858,6 +893,9 @@ export class ExtensionRunner {
 		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
 		// Assigned unconditionally: a headless rebind must not inherit a previous host's controls.
 		this.#sessionModes = contextActions.sessionModes;
+		this.#executionHold = this.agent.kind === "main" && mode === "tui" ? contextActions.executionHold : undefined;
+		this.runtime.executeCommand = (command, args, cwd, options) =>
+			this.runExecution(signal => execCommand(command, args, cwd, { ...options, signal }), options?.signal);
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
@@ -1597,6 +1635,7 @@ export class ExtensionRunner {
 		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
 			this.runtime.sendUserMessage(text, options);
 		const getSessionModes = () => this.#sessionModes;
+		const getExecutionHold = () => (agent.kind === "main" ? this.#executionHold : undefined);
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
@@ -1623,6 +1662,9 @@ export class ExtensionRunner {
 			// Live: a context saved before or across a host rebind sees the current controls.
 			get sessionModes() {
 				return getSessionModes();
+			},
+			get executionHold() {
+				return getExecutionHold();
 			},
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn

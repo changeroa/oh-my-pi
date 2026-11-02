@@ -303,6 +303,19 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	readonly #ownerAdmissionGuards = new Map<string, Set<() => void>>();
+
+	/** Add a session-scoped gate without affecting other owners sharing this manager. */
+	addOwnerAdmissionGuard(ownerId: string, guard: () => void): () => void {
+		let guards = this.#ownerAdmissionGuards.get(ownerId);
+		if (!guards) this.#ownerAdmissionGuards.set(ownerId, (guards = new Set()));
+		guards.add(guard);
+		return () => {
+			guards.delete(guard);
+			if (guards.size === 0) this.#ownerAdmissionGuards.delete(ownerId);
+		};
+	}
+
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -398,6 +411,7 @@ export class AsyncJobManager {
 		}) => Promise<string | AsyncJobRunResult>,
 		options?: AsyncJobRegisterOptions,
 	): string {
+		if (options?.ownerId) for (const guard of this.#ownerAdmissionGuards.get(options.ownerId) ?? []) guard();
 		if (this.#disposed) {
 			throw new Error("Async job manager is disposed");
 		}

@@ -165,7 +165,12 @@ import { emitSessionShutdownEvent, TOP_LEVEL_AGENT, UNAVAILABLE_ANNOTATIONS } fr
 import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
-import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ContextUsage,
+	ExecutionHoldState,
+	ExtensionExecutionHold,
+} from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import {
@@ -902,6 +907,94 @@ function todoRetryMatches(failed: Record<string, unknown>, retry: Record<string,
 }
 
 export class AgentSession implements SettingsScope {
+	#executionHoldState: ExecutionHoldState | undefined;
+	#executionHoldWork: Promise<ExecutionHoldState> | undefined;
+	#executionHoldCancellation = new AbortController();
+	#sideExecutions = new Map<Promise<unknown>, AbortController>();
+	readonly executionHold: ExtensionExecutionHold = {
+		getState: () => this.#getExecutionHoldState(),
+		hold: () => this.#holdExecution(),
+		release: expected => this.#releaseExecution(expected),
+	};
+
+	#getExecutionHoldState(): ExecutionHoldState {
+		const sessionId = this.sessionManager.getSessionId();
+		if (this.#executionHoldState?.sessionId !== sessionId) {
+			this.#executionHoldState = {
+				sessionId,
+				generation: this.#executionHoldState?.generation ?? 0,
+				status: !this.#executionHoldState || this.#executionHoldState.status === "open" ? "open" : "holding",
+			};
+		}
+		return { ...this.#executionHoldState };
+	}
+
+	get isExecutionHeld(): boolean {
+		return this.#getExecutionHoldState().status !== "open";
+	}
+
+	#assertExecutionAllowed(): void {
+		if (this.isExecutionHeld) throw new Error("Session execution is held");
+	}
+
+	#holdExecution(): Promise<ExecutionHoldState> {
+		const state = this.#getExecutionHoldState();
+		if (state.status === "held") return Promise.resolve(state);
+		if (this.#executionHoldWork) return this.#executionHoldWork;
+		if (state.status === "open") {
+			state.status = "holding";
+			state.generation++;
+			this.#executionHoldState = state;
+		}
+		// The latch is already closed before abort yields.
+		this.#executionHoldCancellation.abort();
+		const extensionStopping = this.#extensionRunner?.abortExecutionAndWait?.();
+		for (const controller of this.#sideExecutions.values()) controller.abort();
+		const stopping = this.abort({ goalReason: "internal" });
+		const work = (async (): Promise<ExecutionHoldState> => {
+			await stopping;
+			await this.waitForAdmittedSubmissions();
+			await this.#bash.waitForIdle();
+			await this.#eval.waitForIdle();
+			await extensionStopping;
+			await Promise.allSettled(this.#sideExecutions.keys());
+			const manager = this.#asyncJobManager;
+			if (manager && this.#agentId) {
+				manager.cancelAll({ ownerId: this.#agentId });
+				await manager.waitForOwnerJobs(this.#agentId);
+			}
+			await this.waitForIdle();
+			await this.#bash.flushPending();
+			this.#eval.flushPending();
+			if (this.isBusyForSnapshot || this.hasAdmittedSubmission || this.isSessionTransitioning) {
+				throw new Error("Execution hold has unsettled execution");
+			}
+			const held: ExecutionHoldState = { ...state, status: "held" };
+			if (this.sessionManager.getSessionId() !== state.sessionId) throw new Error("Execution hold session changed");
+			this.#executionHoldState = held;
+			return { ...held };
+		})();
+		this.#executionHoldWork = work;
+		void work
+			.finally(() => {
+				if (this.#executionHoldWork === work) this.#executionHoldWork = undefined;
+			})
+			.catch(() => {});
+		return work;
+	}
+
+	async #releaseExecution(expected: { sessionId: string; generation: number }): Promise<ExecutionHoldState> {
+		const state = this.#getExecutionHoldState();
+		if (state.sessionId !== expected.sessionId || state.generation !== expected.generation)
+			throw new Error("Stale execution hold identity or generation");
+		if (state.status === "holding") throw new Error("Execution hold has not settled");
+		if (state.status === "open") return state;
+		const open: ExecutionHoldState = { ...state, status: "open" };
+		this.#executionHoldState = open;
+		this.#executionHoldCancellation = new AbortController();
+		return { ...open };
+	}
+
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
@@ -1474,6 +1567,7 @@ export class AgentSession implements SettingsScope {
 	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
 	#resumeStrandedIrcAsides(): void {
+		if (this.isExecutionHeld) return;
 		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
 			return;
 		}
@@ -1557,6 +1651,10 @@ export class AgentSession implements SettingsScope {
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
 	#wakeForIrc(wakeRecords: AgentMessage[]): void {
+		if (this.isExecutionHeld) {
+			this.#irc.queueAside(wakeRecords);
+			return;
+		}
 		if (this.#modeExitDrainSuppressionDepth > 0) {
 			this.#irc.queueAside(wakeRecords);
 			return;
@@ -1664,6 +1762,10 @@ export class AgentSession implements SettingsScope {
 				// agent.prompt() claims streaming with no await in between, and the
 				// yield contract above mutates synchronously, so no install can
 				// interleave here.
+				if (this.isExecutionHeld) {
+					this.#irc.queueAside(records);
+					return;
+				}
 				if (this.#workPoolYieldItems.length > 0) {
 					// A pooled turn owns this worker (installed, running, or
 					// dispatch-imminent): park wake-intended records where pooled
@@ -1968,6 +2070,7 @@ export class AgentSession implements SettingsScope {
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
+		this.agent.setExecutionAdmissionGuard(() => this.#assertExecutionAllowed());
 		this.#allowSessionModelFallback = config.allowSessionModelFallback === true;
 		this.#disableModelFallback = config.disableModelFallback === true;
 		this.#interactivePrompts = config.interactivePrompts !== false;
@@ -2134,6 +2237,7 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		this.#extensionRunner?.setExecutionAdmissionGuard?.(() => this.#assertExecutionAllowed());
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
@@ -2312,7 +2416,7 @@ export class AgentSession implements SettingsScope {
 		this.yieldQueue = new YieldQueue({
 			// A transition swaps the transcript under the agent: hold idle deliveries until it
 			// settles, so a result from the outgoing session cannot start a turn in the target.
-			isStreaming: () => this.isStreaming || this.isSessionTransitioning,
+			isStreaming: () => this.isExecutionHeld || this.isStreaming || this.isSessionTransitioning,
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
@@ -2550,6 +2654,7 @@ export class AgentSession implements SettingsScope {
 		// session and for subagents inheriting the process manager alike.
 		if (this.#asyncJobManager && this.#agentId) {
 			const manager = this.#asyncJobManager;
+			this.addDisposer(manager.addOwnerAdmissionGuard(this.#agentId, () => this.#assertExecutionAllowed()));
 			this.#unregisterAsyncDeliverySink = manager.registerDeliverySink(this.#agentId, (jobId, text, job) =>
 				this.#inLogContext(() => this.#deliverAsyncJobResult(manager, jobId, text, job)),
 			);
@@ -3582,9 +3687,11 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
+		this.#assertExecutionAllowed();
 		this.#admittedSubmissionCount++;
 		try {
 			if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+			this.#assertExecutionAllowed();
 			return await this.#inLogContext(work);
 		} finally {
 			if (--this.#admittedSubmissionCount === 0 && this.#admittedSubmissionsSettled) {
@@ -5269,6 +5376,11 @@ export class AgentSession implements SettingsScope {
 		task: (signal: AbortSignal) => Promise<void>,
 		options?: { delayMs?: number; generation?: number; onSkip?: (reason: PostPromptSkipReason) => void },
 	): void {
+		const holdGeneration = this.executionHold.getState().generation;
+		if (this.isExecutionHeld) {
+			options?.onSkip?.("aborted");
+			return;
+		}
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
 		const scheduled = (async () => {
@@ -5286,6 +5398,10 @@ export class AgentSession implements SettingsScope {
 			}
 			if (options?.generation !== undefined && this.#promptGeneration !== options.generation) {
 				options.onSkip?.("stale-generation");
+				return;
+			}
+			if (this.isExecutionHeld || this.executionHold.getState().generation !== holdGeneration) {
+				options?.onSkip?.("aborted");
 				return;
 			}
 			await task(signal);
@@ -5394,6 +5510,10 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
+		if (this.isExecutionHeld) {
+			options.onSkip?.("session-unavailable");
+			return;
+		}
 		const request: ScheduledAgentContinueRequest = {
 			schedulerToken: ++this.#agentContinueSchedulerToken,
 			options,
@@ -6012,6 +6132,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#beginSessionTransition(): Disposable {
+		this.#assertExecutionAllowed();
 		// Before anything awaits: a reload keeps the session id, so only the transition itself can supersede
 		// a pending idle check or an in-flight recap that belong to the transcript being replaced.
 		this.#idleMaintenance?.invalidate();
@@ -7343,11 +7464,15 @@ export class AgentSession implements SettingsScope {
 
 	/** Reduce stored context with the selected shake strategy. */
 	shake(mode: ShakeMode, opts: { config?: ShakeConfig; signal?: AbortSignal } = {}): Promise<ShakeResult> {
-		return this.#inLogContext(() => this.#maintenance.shake(mode, opts));
+		return this.runExecution(
+			signal => this.#inLogContext(() => this.#maintenance.shake(mode, { ...opts, signal })),
+			opts.signal,
+		);
 	}
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		this.#assertExecutionAllowed();
 		return this.#inLogContext(() => this.#maintenance.compact(customInstructions, options));
 	}
 
@@ -7358,6 +7483,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Trigger idle compaction through the automatic maintenance flow. */
 	async runIdleCompaction(): Promise<void> {
+		if (this.isExecutionHeld) return;
 		// A pending async wake means the session is waiting, not idle: a
 		// background job (bash/task) owned by this agent re-wakes the loop when it
 		// completes, and the async-result delivery continues the run. Idle
@@ -8055,6 +8181,7 @@ export class AgentSession implements SettingsScope {
 		normalizedImages: ImageContent[],
 		signal?: AbortSignal,
 	): Promise<CustomMessage | undefined> {
+		if (this.isExecutionHeld) return undefined;
 		const controller = new AbortController();
 		this.#imageDescriptionAbortControllers.add(controller);
 		try {
@@ -8145,6 +8272,7 @@ export class AgentSession implements SettingsScope {
 	 * @throws {AgentBusyError} while a turn runs.
 	 */
 	async resume(): Promise<void> {
+		this.#assertExecutionAllowed();
 		const prompt = this.#recovery.prepareResume();
 		if (!prompt) {
 			await this.prompt(manualContinuePrompt, {
@@ -8731,7 +8859,18 @@ export class AgentSession implements SettingsScope {
 			const sourceBase = this.#tools.baseSystemPrompt;
 			const basePreparation = await this.#tools.buildSystemPromptForAgentStart(prompt, isCurrent, signal);
 			if (!isCurrent()) return cancelled;
-			const result = await this.#extensionRunner?.emitBeforeAgentStart(prompt, images, basePreparation.systemPrompt);
+			const beforeAgentStart = this.#extensionRunner?.emitBeforeAgentStart(
+				prompt,
+				images,
+				basePreparation.systemPrompt,
+			);
+			const result =
+				beforeAgentStart && signal
+					? await untilAborted(signal, beforeAgentStart).catch(error => {
+							if (signal.aborted) return undefined;
+							throw error;
+						})
+					: await beforeAgentStart;
 			if (!isCurrent()) return cancelled;
 			// Overrides are opaque replacements, not string patches. Re-run only policy preparation
 			// against the winning base; discard this attempt's returned context and staged memory.
@@ -9114,10 +9253,15 @@ export class AgentSession implements SettingsScope {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this.#extensionRunner.createCommandContext();
 
+		const holdSignal = this.#executionHoldCancellation.signal;
 		try {
-			await this.#extensionRunner.runScoped(() => command.handler(args, ctx));
+			await untilAborted(
+				holdSignal,
+				this.#extensionRunner.runScoped(() => command.handler(args, ctx)),
+			);
 			return true;
 		} catch (err) {
+			if (holdSignal.aborted) return true;
 			// Emit error via extension runner
 			this.#extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
@@ -9267,7 +9411,12 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+	steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+		return this.#admitSubmission(() => this.#steer(text, images, options));
+	}
+
+	async #steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+		this.#assertExecutionAllowed();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -9291,7 +9440,13 @@ export class AgentSession implements SettingsScope {
 	 * uses this to land its execution directive behind a queued user turn without
 	 * flipping advisor auto-resume.
 	 */
-	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+	followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		return this.#admitSubmission(() => this.#followUp(text, images, options));
+	}
+
+	async #followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		this.#assertExecutionAllowed();
+		const holdGeneration = this.executionHold.getState().generation;
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -9322,6 +9477,8 @@ export class AgentSession implements SettingsScope {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.#assertExecutionAllowed();
+		if (this.executionHold.getState().generation !== holdGeneration) return;
 		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		const directive: AgentMessage = {
@@ -9362,7 +9519,15 @@ export class AgentSession implements SettingsScope {
 	 * @returns `true` when the message was admitted onto the live run's queue;
 	 *   `false` when no run was live at (or survived) admission.
 	 */
-	async joinActiveTurn(
+	joinActiveTurn(
+		text: string,
+		images?: ImageContent[],
+		options?: { queue?: "steering" | "followUp" },
+	): Promise<boolean> {
+		return this.#admitSubmission(() => this.#joinActiveTurn(text, images, options));
+	}
+
+	async #joinActiveTurn(
 		text: string,
 		images?: ImageContent[],
 		options?: { queue?: "steering" | "followUp" },
@@ -9510,6 +9675,8 @@ export class AgentSession implements SettingsScope {
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const rawText = options?.rawText ?? text;
+		const holdGeneration = this.executionHold.getState().generation;
+		this.#assertExecutionAllowed();
 		const preprocessed = options?.preprocessed;
 		const prependMessages = options?.prependMessages ?? [];
 		// Captured before any await below so the aside branch can detect a
@@ -9541,6 +9708,8 @@ export class AgentSession implements SettingsScope {
 			: normalizedImages?.length
 				? await this.#buildImageDescriptionNotice(normalizedImages)
 				: undefined;
+		this.#assertExecutionAllowed();
+		if (this.executionHold.getState().generation !== holdGeneration) return false;
 		if (options?.promptGeneration !== undefined && this.#promptGeneration !== options.promptGeneration) {
 			return false;
 		}
@@ -9817,6 +9986,7 @@ export class AgentSession implements SettingsScope {
 	 * Gate for idle-path queued-message auto-continue (see `#scheduleQueuedMessageDrain`).
 	 */
 	#canAutoContinueForFollowUp(): boolean {
+		if (this.isExecutionHeld) return false;
 		if (this.isRetrying) return false;
 		// An ACP client that defers agent-initiated turns owns turn
 		// lifecycle, and a queued steer/follow-up may only resume while a
@@ -10036,6 +10206,7 @@ export class AgentSession implements SettingsScope {
 		const descriptionNotice = preprocessed
 			? preprocessed.descriptionNotice
 			: await this.#buildSkillImageDescriptionNotice(normalizedAppMessage);
+		this.#assertExecutionAllowed();
 		if (deliverAs === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
 			// Non-interrupting: rides the same step-boundary aside poll as
@@ -10313,7 +10484,11 @@ export class AgentSession implements SettingsScope {
 	 * Explicit `deliverAs` queues without starting a turn in either state; `aside` at
 	 * an idle session instead starts a turn, since there is no live run to inject into.
 	 */
-	async sendUserMessage(
+	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<void> {
+		return this.#admitSubmission(() => this.#sendUserMessage(content, options));
+	}
+
+	async #sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageOptions,
 	): Promise<void> {
@@ -12057,6 +12232,7 @@ export class AgentSession implements SettingsScope {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#assertExecutionAllowed();
 		return this.#inLogContext(() => this.#maintenance.handoff(customInstructions, options));
 	}
 
@@ -12515,6 +12691,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Retry the last failed assistant turn when the session is idle. */
 	async retry(): Promise<boolean> {
+		this.#assertExecutionAllowed();
 		const didRetry = await this.#recovery.retry();
 		// A manual retry is the user resuming the run they interrupted, so it lifts the
 		// interrupt's auto-resume suppression the same way a typed prompt does.
@@ -12537,6 +12714,7 @@ export class AgentSession implements SettingsScope {
 	 * a model, or with nothing left unfinished.
 	 */
 	async restoreInterruptedTurn(): Promise<boolean> {
+		this.#assertExecutionAllowed();
 		const branch = this.sessionManager.getBranch();
 		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
 		const model = this.model;
@@ -12755,7 +12933,22 @@ export class AgentSession implements SettingsScope {
 	 * streaming assistant text so the model sees the half-finished response
 	 * rather than missing context.
 	 */
-	async runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+	/** Track a host execution outside the agent loop under the same hold barrier. */
+	runExecution<T>(work: (signal: AbortSignal) => Promise<T>, callerSignal?: AbortSignal): Promise<T> {
+		this.#assertExecutionAllowed();
+		const controller = new AbortController();
+		const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
+		const execution = work(signal);
+		this.#sideExecutions.set(execution, controller);
+		void execution.finally(() => this.#sideExecutions.delete(execution)).catch(() => {});
+		return execution;
+	}
+
+	runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+		return this.runExecution(signal => this.#runEphemeralTurn({ ...args, signal }), args.signal);
+	}
+
+	async #runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
 		const model = this.model;
 		if (!model) {
 			throw new Error("No active model on session");
@@ -12763,6 +12956,7 @@ export class AgentSession implements SettingsScope {
 		const modelDescription = `${model.provider}/${model.id} (${model.api})`;
 		const sessionGeneration = this.#sessionGeneration;
 		const assertEphemeralTurnReady = () => {
+			this.#assertExecutionAllowed();
 			args.signal?.throwIfAborted();
 			// The side request must use the exact model snapshot captured above.
 			// `modelsAreEqual` intentionally compares only provider/id, while a

@@ -405,6 +405,16 @@ interface QueuedMessageClaim {
 }
 
 export class Agent {
+	#executionAdmissionGuard: (() => void) | undefined;
+
+	/** Host-owned execution barrier. Queue inspection and cancellation remain available. */
+	setExecutionAdmissionGuard(guard: (() => void) | undefined): void {
+		this.#executionAdmissionGuard = guard;
+	}
+
+	assertExecutionAllowed(): void {
+		this.#executionAdmissionGuard?.();
+	}
 	#state: AgentState = {
 		systemPrompt: [],
 		model: getBundledModel("google", "gemini-2.5-flash-lite-preview-06-17"),
@@ -1015,7 +1025,9 @@ export class Agent {
 	}
 
 	async #runBeforeModelCallHooks(signal: AbortSignal | undefined, context: AgentContext): Promise<void> {
+		this.assertExecutionAllowed();
 		for (const hook of this.#beforeModelCallHooks) await hook(signal, context);
+		this.assertExecutionAllowed();
 	}
 
 	async #runBeforeQueuedMessageDequeueHooks(signal?: AbortSignal): Promise<void> {
@@ -1035,6 +1047,7 @@ export class Agent {
 	}
 
 	async #prepareQueuedMessageBatch(queue: QueuedMessageQueue, signal: AbortSignal): Promise<AgentMessage[]> {
+		this.assertExecutionAllowed();
 		if (this.#queuedMessageClaims[queue]) return [];
 		const messages = queue === "steering" ? this.#dequeueSteeringMessages() : this.#dequeueFollowUpMessages();
 		const prepare = this.prepareQueuedMessages;
@@ -1050,6 +1063,7 @@ export class Agent {
 		const preparationSignal = AbortSignal.any([signal, claim.controller.signal]);
 		try {
 			const preparation = await prepare(messages, preparationSignal, queue);
+			this.assertExecutionAllowed();
 			signal.throwIfAborted();
 			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
 			const additional = preparation?.commit();
@@ -1649,6 +1663,7 @@ export class Agent {
 		imagesOrOptions?: ImageContent[] | AgentPromptOptions,
 		options?: AgentPromptOptions,
 	) {
+		this.assertExecutionAllowed();
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1716,6 +1731,7 @@ export class Agent {
 	}
 
 	async #continue(signal?: AbortSignal) {
+		this.assertExecutionAllowed();
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1813,6 +1829,7 @@ export class Agent {
 		continuationSignal?: AbortSignal,
 		runStateClaimed = false,
 	) {
+		this.assertExecutionAllowed();
 		const model = this.#state.model;
 		if (!model) throw new Error("No model configured");
 

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Extensions in the main TUI can hold execution until owned work settles and release admission without replaying queued work.
+
 - Added an opt-in Harness Runtime extension and isolated launcher for validating OMP alongside Codex.
 
 - With the Hindsight memory backend, `retain` and `learn` can now store a memory with `scope: "global"` so every project recalls it. It is opt-in through the new `hindsight.globalScope` setting (off by default) and needs `global` or `per-project-tagged` scoping ([#17706](https://github.com/can1357/oh-my-pi/pull/17706) by [@alphastorm](https://github.com/alphastorm), from [#15030](https://github.com/can1357/oh-my-pi/pull/15030) by [@kithawk](https://github.com/kithawk)).
