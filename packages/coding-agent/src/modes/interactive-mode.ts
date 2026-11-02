@@ -3220,11 +3220,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#deferLoopAutoSubmit(callback: () => void): void {
+		if (this.session.isExecutionHeld) return;
+		const holdGeneration = this.session.executionHold.getState().generation;
 		// Brief delay so the user has a chance to press Esc between iterations.
 		this.#loopAutoSubmitTimer = setTimeout(() => {
 			this.#loopAutoSubmitTimer = undefined;
 			try {
-				if (!this.loopModeEnabled || !this.onInputCallback) return;
+				if (
+					this.session.isExecutionHeld ||
+					this.session.executionHold.getState().generation !== holdGeneration ||
+					!this.loopModeEnabled ||
+					!this.onInputCallback
+				)
+					return;
 				callback();
 			} finally {
 				this.syncIdleMaintenanceView();
@@ -3242,6 +3250,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleGoalContinuation(): void {
 		this.#cancelGoalContinuation();
+		if (this.session.isExecutionHeld) return;
+		const holdGeneration = this.session.executionHold.getState().generation;
 		if (this.loopModeEnabled) return;
 		if (!this.onInputCallback) return;
 		if (!cfgGoalContinuationModes.get(this.session.settings).includes("interactive")) return;
@@ -3259,6 +3269,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
 			try {
+				if (this.session.executionHold.getState().generation !== holdGeneration) return;
 				if (!this.onInputCallback) return;
 				if (!this.goalModeEnabled || this.goalModePaused) return;
 				// The 800ms timer can outlive the idle window that scheduled it: a
@@ -3323,7 +3334,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#isAutoSubmitBlocked(): boolean {
-		return this.session.isStreaming || this.session.isCompacting || this.session.hasPostPromptWork;
+		return (
+			this.session.isExecutionHeld ||
+			this.session.isStreaming ||
+			this.session.isCompacting ||
+			this.session.hasPostPromptWork
+		);
 	}
 
 	#submitLoopPromptWhenReady(prompt: string): void {
@@ -3351,6 +3367,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #loopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
+		if (this.session.isExecutionHeld) return;
+		const holdGeneration = this.session.executionHold.getState().generation;
 		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => {
@@ -3375,6 +3393,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// iteration that did not run, and after the blocked-check/defer above so
 		// a streaming turn cannot re-run the command on every retry tick.
 		if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
+		if (this.session.executionHold.getState().generation !== holdGeneration) return;
 
 		// The gate awaited a child process: a turn may have started meanwhile
 		// (async job, idle flush), so re-check before spending budget or
@@ -3407,6 +3426,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else if (action === "reset") {
 			await this.handleClearCommand();
 		}
+		if (this.session.executionHold.getState().generation !== holdGeneration) return;
 		this.#submitLoopPromptWhenReady(prompt);
 	}
 
@@ -3429,12 +3449,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#loopConditionAbort = controller;
 		let verdict: LoopConditionVerdict;
 		try {
-			verdict = await evaluateLoopCondition(condition, {
-				cwd: this.sessionManager.getCwd(),
-				timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
-				signal: controller.signal,
-				sessionId: this.sessionManager.getSessionId(),
-			});
+			verdict = await this.session.runExecution(
+				signal =>
+					evaluateLoopCondition(condition, {
+						cwd: this.sessionManager.getCwd(),
+						timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
+						signal,
+						sessionId: this.sessionManager.getSessionId(),
+					}),
+				controller.signal,
+			);
 		} finally {
 			if (this.#loopConditionAbort === controller) this.#loopConditionAbort = undefined;
 		}

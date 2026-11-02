@@ -85,7 +85,12 @@ export class EvalRunner {
 
 	/** Rejects new eval work once session disposal begins. */
 	assertExecutionAllowed(): void {
+		this.#host.agent.assertExecutionAllowed();
 		if (this.#disposing) throw new Error("Python execution is unavailable while session disposal is in progress");
+	}
+
+	async waitForIdle(): Promise<void> {
+		await Promise.allSettled(this.#activeExecutions);
 	}
 
 	/** Tracks externally started Python work so disposal can await and abort it. */

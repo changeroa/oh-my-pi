@@ -61,6 +61,7 @@ export class BashRunner {
 	readonly #host: BashRunnerHost;
 	#abortControllers = new Set<AbortController>();
 	#pendingMessages: PendingBashMessage[] = [];
+	#executions = new Set<Promise<BashResult>>();
 	#sessionTarget: BashSessionTarget;
 
 	constructor(host: BashRunnerHost) {
@@ -73,7 +74,23 @@ export class BashRunner {
 	}
 
 	/** Executes a bash command while retaining the session and branch that owned its start. */
-	async executeBash(
+	executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
+	): Promise<BashResult> {
+		this.#host.agent.assertExecutionAllowed();
+		const execution = this.#executeBash(command, onChunk, options);
+		this.#executions.add(execution);
+		void execution.finally(() => this.#executions.delete(execution)).catch(() => {});
+		return execution;
+	}
+
+	async waitForIdle(): Promise<void> {
+		await Promise.allSettled(this.#executions);
+	}
+
+	async #executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
@@ -113,6 +130,7 @@ export class BashRunner {
 							?.getRegisteredTool("bash")
 							?.definition.shellEnv?.({ command, cwd, env: { ...this.#host.settings.getShellConfig().env } })
 					: undefined;
+			this.#host.agent.assertExecutionAllowed();
 
 			const abortController = new AbortController();
 			this.#abortControllers.add(abortController);

@@ -355,7 +355,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	exec(command: string, args: string[], options?: ExecOptions) {
-		return execCommand(command, args, options?.cwd ?? this.cwd, options);
+		return (this.runtime.executeCommand ?? execCommand)(command, args, options?.cwd ?? this.cwd, options);
 	}
 
 	getActiveTools(): string[] {

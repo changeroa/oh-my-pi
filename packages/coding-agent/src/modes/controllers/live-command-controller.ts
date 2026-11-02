@@ -42,6 +42,10 @@ export class LiveCommandController {
 	readonly #createSession: LiveSessionFactory | undefined;
 
 	#session: LiveSessionController | undefined;
+	#starting = 0;
+	#cleanupFailed = false;
+	#disposed = false;
+	readonly #removeHoldBlocker: () => void;
 	#settling: Promise<void> | undefined;
 	#visualizer: LiveVisualizer | undefined;
 	#detachedEditor: CustomEditor | undefined;
@@ -56,24 +60,30 @@ export class LiveCommandController {
 	constructor(ctx: InteractiveModeContext, createSession?: LiveSessionFactory) {
 		this.#ctx = ctx;
 		this.#createSession = createSession;
+		this.#removeHoldBlocker = ctx.session.addExecutionHoldBlocker(() => {
+			if (this.#cleanupFailed) return "Realtime voice cleanup is unconfirmed; execution remains held";
+			return this.active ? "Realtime voice is active or starting; stop it explicitly and retry hold" : undefined;
+		});
 	}
 
 	/** Whether a live session is connected, connecting, or closing. */
 	get active(): boolean {
-		return this.#session !== undefined || this.#settling !== undefined;
+		return this.#starting > 0 || this.#session !== undefined || this.#settling !== undefined;
 	}
 
 	/** Start live mode, or stop the currently active session. */
 	async handleCommand(): Promise<void> {
-		if (this.#session) {
+		if (this.#session || (this.#ctx.session.isExecutionHeld && this.#settling)) {
 			await this.stop();
 			return;
 		}
-		while (this.#settling) await this.#settling;
-		// Another start may have claimed the slot while the previous session finished closing.
-		if (this.#session) return;
-		// A connect failure was already shown; anything else (factory, mounting) propagates.
-		await this.#start(resolveLiveVoice(this.#ctx.settings));
+		await this.#admitStart(async () => {
+			while (this.#settling) await this.#settling;
+			this.#assertStartAllowed();
+			// Another start may have claimed the slot while the previous session finished closing.
+			if (this.#session) return;
+			await this.#start(resolveLiveVoice(this.#ctx.settings));
+		});
 	}
 
 	/**
@@ -85,9 +95,11 @@ export class LiveCommandController {
 		if (typeof options.sdpOffer !== "string" || !options.sdpOffer.trim()) {
 			throw new Error("startLive requires a non-empty sdpOffer");
 		}
-		while (this.#settling) await this.#settling;
-		const voice = resolveLiveVoice(this.#ctx.settings, options.voice);
-		const outcome = await this.#start(voice, options);
+		const { voice, outcome } = await this.#admitStart(async () => {
+			while (this.#settling) await this.#settling;
+			const voice = resolveLiveVoice(this.#ctx.settings, options.voice);
+			return { voice, outcome: await this.#start(voice, options) };
+		});
 		if ("error" in outcome) throw outcome.error;
 		const { session } = outcome;
 		const stop = async (): Promise<void> => {
@@ -100,6 +112,21 @@ export class LiveCommandController {
 			throw new Error("The live session stopped before its SDP answer was available");
 		}
 		return { sdpAnswer, voice, stop };
+	}
+
+	#assertStartAllowed(): void {
+		if (this.#disposed) throw new Error("Live controller is disposed");
+		if (this.#ctx.session.isExecutionHeld) throw new Error("Session execution is held");
+	}
+
+	async #admitStart<T>(start: () => Promise<T>): Promise<T> {
+		this.#assertStartAllowed();
+		this.#starting++;
+		try {
+			return await start();
+		} finally {
+			this.#starting--;
+		}
 	}
 
 	/** Stop the active live session and restore the editor. */
@@ -120,6 +147,7 @@ export class LiveCommandController {
 
 	/** Release UI resources during synchronous InteractiveMode teardown. */
 	dispose(): void {
+		this.#disposed = true;
 		const session = this.#session;
 		if (session) {
 			this.#finish(session);
@@ -129,6 +157,8 @@ export class LiveCommandController {
 		} else {
 			this.#restoreEditor();
 		}
+		// Retain the blocker until teardown is actually settled, including queued starts.
+		if (!this.active && !this.#cleanupFailed) this.#removeHoldBlocker();
 	}
 
 	/**
@@ -136,6 +166,7 @@ export class LiveCommandController {
 	 * claim (`#session = session`) run synchronously, so concurrent starts cannot both win.
 	 */
 	async #start(voice: string, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
+		this.#assertStartAllowed();
 		if (this.#session) throw new Error("A live session is already active");
 		this.#assistantTranscriptTurn = 0;
 		this.#assistantTranscriptStartedAt = 0;
@@ -188,6 +219,7 @@ export class LiveCommandController {
 		};
 		let session: LiveSessionController;
 		try {
+			this.#assertStartAllowed();
 			session = this.#createSession ? this.#createSession(options) : new LiveSessionController(options);
 		} catch (cause) {
 			// No session to finish: put the editor back before the failure propagates.
@@ -197,6 +229,7 @@ export class LiveCommandController {
 		this.#session = session;
 
 		try {
+			this.#assertStartAllowed();
 			await session.start();
 		} catch (cause) {
 			const error = toError(cause);
@@ -287,6 +320,7 @@ export class LiveCommandController {
 		this.#restoreEditor();
 		if (error) this.#ctx.showError(error.message);
 		const settling = session.stop().catch(cause => {
+			this.#cleanupFailed = true;
 			logger.debug("Live session cleanup failed", { error: toError(cause).message });
 		});
 		this.#settling = settling;

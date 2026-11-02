@@ -743,6 +743,19 @@ export interface ExtensionLiveSession {
 	stop(): Promise<void>;
 }
 
+export interface ExecutionHoldState {
+	sessionId: string;
+	generation: number;
+	status: "open" | "holding" | "held";
+}
+
+/** A persistent execution-admission barrier. Release opens admission without replaying work. */
+export interface ExtensionExecutionHold {
+	getState(): ExecutionHoldState;
+	hold(): Promise<ExecutionHoldState>;
+	release(expected: { sessionId: string; generation: number }): Promise<ExecutionHoldState>;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -808,6 +821,8 @@ export interface ExtensionContext {
 	 * only: `undefined` in print, JSON, RPC, and ACP modes and in subagents.
 	 */
 	sessionModes?: ExtensionSessionModes;
+	/** Main TUI only. Feature-detect before using managed execution control. */
+	executionHold?: ExtensionExecutionHold;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
@@ -2323,6 +2338,8 @@ export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTie
 
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
+	/** Host-owned command execution, installed when a session binds the extension. */
+	executeCommand?: (command: string, args: string[], cwd: string, options?: ExecOptions) => Promise<ExecResult>;
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
@@ -2366,6 +2383,7 @@ export interface ExtensionContextActions {
 	getPendingPlanReview?: () => PlanReviewRequestedEvent | undefined;
 	openPlanReview?: () => Promise<boolean>;
 	sessionModes?: ExtensionSessionModes;
+	executionHold?: ExtensionExecutionHold;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
