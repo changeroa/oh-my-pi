@@ -910,6 +910,7 @@ export class AgentSession implements SettingsScope {
 	#executionHoldState: ExecutionHoldState | undefined;
 	#executionHoldWork: Promise<ExecutionHoldState> | undefined;
 	#executionHoldCancellation = new AbortController();
+	#executionHoldBlockers = new Set<() => string | undefined>();
 	#sideExecutions = new Map<Promise<unknown>, AbortController>();
 	readonly executionHold: ExtensionExecutionHold = {
 		getState: () => this.#getExecutionHoldState(),
@@ -935,6 +936,14 @@ export class AgentSession implements SettingsScope {
 
 	#assertExecutionAllowed(): void {
 		if (this.isExecutionHeld) throw new Error("Session execution is held");
+	}
+
+	/** Register host-owned execution that must be stopped explicitly before confirming hold. */
+	addExecutionHoldBlocker(blocker: () => string | undefined): () => void {
+		this.#executionHoldBlockers.add(blocker);
+		return () => {
+			this.#executionHoldBlockers.delete(blocker);
+		};
 	}
 
 	#holdExecution(): Promise<ExecutionHoldState> {
@@ -968,6 +977,10 @@ export class AgentSession implements SettingsScope {
 			this.#eval.flushPending();
 			if (this.isBusyForSnapshot || this.hasAdmittedSubmission || this.isSessionTransitioning) {
 				throw new Error("Execution hold has unsettled execution");
+			}
+			for (const blocker of this.#executionHoldBlockers) {
+				const reason = blocker();
+				if (reason) throw new Error(reason);
 			}
 			const held: ExecutionHoldState = { ...state, status: "held" };
 			if (this.sessionManager.getSessionId() !== state.sessionId) throw new Error("Execution hold session changed");
