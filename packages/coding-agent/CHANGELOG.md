@@ -6,9 +6,9 @@
 
 - Extensions and SDK hosts can list and answer real native TUI questions, approvals, plan reviews, and settings confirmations through `userInteractions`, with session-bound responses and idempotent delivery receipts ([#2](https://github.com/changeroa/oh-my-pi/pull/2) by [@changeroa](https://github.com/changeroa)).
 - Extensions in the main TUI can hold execution until owned work settles and release admission without replaying queued work.
-- Trusted TUI coordinators can wait for a non-interrupting owner-restart latch, durably park pending input, stage one real continuation while held, and release only that continuation.
-- Structured native launches can select an isolated settings home and private Iyen bootstrap with early `--agent-dir` and `--iyen-omp-bootstrap` arguments.
-- Owner-restart controllers attest the lead's actual SDK/settings directories, effective approval mode and model profile, and refuse profile drift instead of applying managed-worker defaults.
+- Trusted TUI coordinators can wait for a non-interrupting owner-restart latch, durably park pending input, stage one real continuation while held, and release only that continuation ([#3](https://github.com/changeroa/oh-my-pi/pull/3) by [@changeroa](https://github.com/changeroa)).
+- Structured native launches can select an isolated settings home and private Iyen bootstrap with early `--agent-dir` and `--iyen-omp-bootstrap` arguments and a constructor-time `--start-held` fence ([#3](https://github.com/changeroa/oh-my-pi/pull/3) by [@changeroa](https://github.com/changeroa)).
+- Owner-restart controllers attest the lead's actual SDK/settings directories, effective approval mode and model profile, and refuse profile drift instead of applying managed-worker defaults ([#3](https://github.com/changeroa/oh-my-pi/pull/3) by [@changeroa](https://github.com/changeroa)).
 
 - Added an opt-in Harness Runtime extension and isolated launcher for validating OMP alongside Codex.
 
