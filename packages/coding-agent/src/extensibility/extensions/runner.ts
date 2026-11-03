@@ -555,6 +555,11 @@ export class ExtensionRunner {
 	#ownedExecutions = new Map<Promise<unknown>, AbortController>();
 	#executionAdmissionGuard: (() => void) | undefined;
 
+	/** Native restart waits for these executions; it must not abort them. */
+	get hasActiveExecution(): boolean {
+		return this.#ownedExecutions.size > 0;
+	}
+
 	setExecutionAdmissionGuard(guard: () => void): void {
 		this.#executionAdmissionGuard = guard;
 	}

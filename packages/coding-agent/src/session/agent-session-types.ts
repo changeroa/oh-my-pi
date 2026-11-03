@@ -202,6 +202,10 @@ export interface AgentSessionConfig {
 	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
+	/** Effective SDK agent root, retained separately from a supplied Settings instance. */
+	agentDir?: string;
+	/** Close admission in the constructor, before startup work can enter the session. */
+	startExecutionHeld?: boolean;
 	/** User-authorized model agents inherited from the parent session for nested delegation. */
 	inheritedSessionAgents?: readonly AgentDefinition[];
 	/** Models to cycle through with Ctrl+P (from --models flag). */

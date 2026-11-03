@@ -30,6 +30,8 @@ export interface Args {
 	profile?: string;
 	alias?: string;
 	allowHome?: boolean;
+	/** Close native execution admission before session construction completes. */
+	startHeld?: boolean;
 	provider?: string;
 	model?: string;
 	config?: string[];
@@ -287,7 +289,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// value-taking built-in (`--plan`, `--model`, …) that branch would consume
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
-		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
+		const extFlag = arg.startsWith("--") && arg !== "--start-held" ? extensionFlags?.get(arg.slice(2)) : undefined;
 		if (extFlag) {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {
@@ -337,6 +339,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.version = true;
 		} else if (arg === "--allow-home") {
 			result.allowHome = true;
+		} else if (arg === "--start-held") {
+			result.startHeld = true;
 		} else if (arg === "--profile" && i + 1 < args.length) {
 			// Normally stripped by `extractProfileFlags` before parseArgs sees it;
 			// kept here as a fallback for direct parseArgs callers.

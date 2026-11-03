@@ -23,6 +23,7 @@ import {
 	getActiveProfile,
 	MIN_BUN_VERSION,
 	resolveProfileEnv,
+	setAgentDir,
 	setProfile,
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
@@ -450,7 +451,14 @@ export async function runCli(argv: string[]): Promise<void> {
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);
 		resolvedArgv = extracted.argv;
-		if (extracted.profile !== undefined) {
+		if (extracted.iyenOmpBootstrap !== undefined) {
+			if (process.env.IYEN_OMP_BOOTSTRAP && process.env.IYEN_OMP_BOOTSTRAP !== extracted.iyenOmpBootstrap)
+				throw new Error("Conflicting Iyen bootstrap environment and flag");
+			process.env.IYEN_OMP_BOOTSTRAP = extracted.iyenOmpBootstrap;
+		}
+		if (extracted.agentDir !== undefined) {
+			setAgentDir(extracted.agentDir);
+		} else if (extracted.profile !== undefined) {
 			setProfile(extracted.profile);
 		} else {
 			// No explicit --profile: activate any OMP_PROFILE/PI_PROFILE inherited

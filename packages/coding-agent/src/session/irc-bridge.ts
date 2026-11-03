@@ -14,6 +14,8 @@ export interface IrcBridgeHost {
 	agent: Agent;
 	sessionManager: SessionManager;
 	isDisposed(): boolean;
+	/** Refuse before accepting delivery when an owner restart has latched execution. */
+	assertDeliveryAllowed?(): void;
 	isStreaming(): boolean;
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
@@ -222,6 +224,7 @@ export class IrcBridge {
 	/** Delivers an IRC message into the recipient session without awaiting any wake turn. */
 	async deliver(msg: IrcMessage): Promise<"injected" | "woken"> {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
+		this.#host.assertDeliveryAllowed?.();
 		const streaming = this.#host.isStreaming();
 		const planModeIdle = !streaming && this.#host.planModeEnabled();
 		const registry = AgentRegistry.global();

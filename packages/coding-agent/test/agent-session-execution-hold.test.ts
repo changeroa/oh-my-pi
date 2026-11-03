@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import { type } from "@oh-my-pi/omptype";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
@@ -10,7 +11,9 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { cfgToolsApprovalMode } from "../src/tools/settings";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -18,11 +21,20 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(responses: MockResponseSource = [{ content: ["done"] }], manager?: AsyncJobManager) {
+function harness(
+	responses: MockResponseSource = [{ content: ["done"] }],
+	manager?: AsyncJobManager,
+	sessionManager = SessionManager.inMemory(),
+	startExecutionHeld = false,
+	profile: { settings?: Settings; agentDir?: string; autoApprove?: boolean } = {},
+) {
 	const auth = createInMemoryAuthStorage();
 	cleanups.push(() => auth.close());
 	auth.keys.setRuntime("anthropic", "test-key");
 	const provider = createMockModel({ responses });
+	const settings =
+		profile.settings ??
+		Settings.isolated({ "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false });
 	const session = new AgentSession({
 		agent: new Agent({
 			getApiKey: () => "test-key",
@@ -30,8 +42,11 @@ function harness(responses: MockResponseSource = [{ content: ["done"] }], manage
 			convertToLlm,
 			streamFn: provider.stream,
 		}),
-		sessionManager: SessionManager.inMemory(),
-		settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false }),
+		sessionManager,
+		startExecutionHeld,
+		settings,
+		agentDir: profile.agentDir,
+		autoApprove: profile.autoApprove,
 		modelRegistry: new ModelRegistry(auth),
 		agentId: "hold-owner",
 		asyncJobManager: manager,
@@ -300,4 +315,229 @@ describe("AgentSession execution hold", () => {
 		expect(session.getGoalModeState()).toEqual(paused);
 		expect(provider.calls).toHaveLength(0);
 	});
+});
+
+describe("owner restart native admission", () => {
+	const authorizationHash = "a".repeat(64);
+
+	it("defers a busy tool without aborting the current owner turn", async () => {
+		const entered = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const temp = TempDir.createSync("@omp-restart-busy-");
+		cleanups.push(() => temp.removeSync());
+		const directory = fs.realpathSync(temp.path());
+		let aborted = false;
+		const { session, provider } = harness(
+			[
+				{ content: [{ type: "toolCall", id: "restart-wait", name: "wait", arguments: {} }] },
+				{ content: ["finished naturally"] },
+			],
+			undefined,
+			SessionManager.create(directory, directory),
+		);
+		session.agent.setTools([
+			{
+				name: "wait",
+				label: "Wait",
+				description: "Wait",
+				parameters: type({}),
+				async execute(_id, _params, signal) {
+					signal?.addEventListener(
+						"abort",
+						() => {
+							aborted = true;
+						},
+						{ once: true },
+					);
+					entered.resolve();
+					await finish.promise;
+					return { content: [{ type: "text", text: "finished" }] };
+				},
+			},
+		]);
+		const running = session.prompt("finish this turn");
+		await entered.promise;
+		try {
+			expect(await session.executionHold.tryHoldForRestart("restart", authorizationHash)).toBeNull();
+			expect(session.executionHold.getState().status).toBe("open");
+			expect(aborted).toBe(false);
+		} finally {
+			finish.resolve();
+		}
+		await running;
+		expect(provider.calls).toHaveLength(2);
+		expect(aborted).toBe(false);
+		expect((await session.executionHold.tryHoldForRestart("restart", authorizationHash))?.status).toBe("held");
+	});
+
+	it("durably parks complete input without clearing the native queue or converting it to received user input", async () => {
+		const temp = TempDir.createSync("@omp-restart-park-");
+		cleanups.push(() => temp.removeSync());
+		const directory = fs.realpathSync(temp.path());
+		const manager = SessionManager.create(directory, directory);
+		const { session, provider } = harness(undefined, undefined, manager);
+		const queued = { role: "user" as const, content: "original pending owner input", timestamp: Date.now() };
+		session.agent.followUp(queued);
+		const work = session.executionHold.tryHoldForRestart("park", authorizationHash);
+		expect(session.executionHold.getState().status).toBe("holding");
+		const held = await work;
+		expect(held?.status).toBe("held");
+		expect(session.agent.peekFollowUpQueue()).toEqual([queued]);
+		await expect(session.prompt("must remain fenced")).rejects.toThrow("held");
+		await expect(
+			session.deliverIrcMessage({
+				id: "late-peer",
+				from: "peer",
+				to: "hold-owner",
+				body: "must not be accepted",
+				ts: Date.now(),
+			}),
+		).rejects.toThrow("before acceptance");
+		const rows = Bun.JSONL.parse(await Bun.file(manager.getSessionFile()!).text()) as Array<Record<string, unknown>>;
+		const parked = rows.find(row => row.type === "custom" && row.customType === "owner-restart-parked-input");
+		expect(parked?.data).toMatchObject({
+			operationId: "park",
+			disposition: "parked-not-replayed",
+			followUp: [queued],
+		});
+		expect(rows.filter(row => row.type === "message")).toEqual([]);
+		expect(provider.calls).toHaveLength(0);
+		await expect(
+			Promise.resolve().then(() => session.executionHold.tryHoldForRestart("different", authorizationHash)),
+		).rejects.toThrow("conflicts");
+	});
+
+	it("stages one durable user entry while held and claims exactly that continuation on release", async () => {
+		const temp = TempDir.createSync("@omp-restart-stage-");
+		cleanups.push(() => temp.removeSync());
+		const directory = fs.realpathSync(temp.path());
+		const manager = SessionManager.create(directory, directory);
+		const { session, provider } = harness(undefined, undefined, manager, true);
+		expect(session.executionHold.isRestartStartupHeld()).toBe(true);
+		await expect(session.prompt("startup must not infer")).rejects.toThrow("held");
+		const held = await session.executionHold.tryHoldForRestart("continue", authorizationHash);
+		if (!held) throw new Error("Fixture did not acquire native latch");
+		expect(held.generation).toBe(1);
+		expect(session.executionHold.isRestartStartupHeld()).toBe(false);
+		const staged = await session.executionHold.stageRestartContinuation(
+			"continue",
+			authorizationHash,
+			"service continuation",
+		);
+		expect(
+			await session.executionHold.stageRestartContinuation("continue", authorizationHash, "service continuation"),
+		).toEqual(staged);
+		const rows = Bun.JSONL.parse(await Bun.file(manager.getSessionFile()!).text()) as Array<Record<string, unknown>>;
+		expect(rows.find(row => row.id === staged.entryId)).toMatchObject({
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "service continuation" }] },
+		});
+		expect(session.executionHold.getState().status).toBe("held");
+		expect(provider.calls).toHaveLength(0);
+		await expect(session.prompt("racing local input")).rejects.toThrow("held");
+		await expect(
+			Promise.resolve().then(() =>
+				session.executionHold.stageRestartContinuation("continue", authorizationHash, "changed"),
+			),
+		).rejects.toThrow("conflict");
+		await session.executionHold.releaseRestartContinuation("continue", authorizationHash, held);
+		await session.executionHold.releaseRestartContinuation("continue", authorizationHash, held);
+		await session.waitForIdle();
+		expect(provider.calls).toHaveLength(1);
+		expect(session.messages.filter(message => message.role === "user")).toHaveLength(1);
+	});
+
+	it("does not cancel a suppressed background job to manufacture idle", async () => {
+		const manager = new AsyncJobManager({});
+		cleanups.push(async () => {
+			await manager.dispose();
+		});
+		const { session } = harness(undefined, manager);
+		const finish = Promise.withResolvers<string>();
+		const id = manager.register("bash", "still owned", () => finish.promise, { ownerId: "hold-owner" });
+		manager.watchJobs([id]);
+		try {
+			expect(await session.executionHold.tryHoldForRestart("wait-background", authorizationHash)).toBeNull();
+			expect(manager.getJob(id)?.abortController.signal.aborted).toBe(false);
+			expect(session.executionHold.getState().status).toBe("open");
+		} finally {
+			finish.resolve("finished naturally");
+		}
+		await manager.waitForOwnerJobs("hold-owner");
+	});
+});
+
+it("a native restart persistence failure retains pending input and permanently fences the uncertain latch", async () => {
+	const temp = TempDir.createSync("@omp-restart-durability-");
+	cleanups.push(() => temp.removeSync());
+	const directory = fs.realpathSync(temp.path());
+	const manager = SessionManager.create(directory, directory);
+	const { session, provider } = harness(undefined, undefined, manager);
+	const queued = { role: "user" as const, content: "input with uncertain delivery", timestamp: Date.now() };
+	session.agent.followUp(queued);
+	vi.spyOn(manager, "flush").mockRejectedValueOnce(new Error("native disk flush failed"));
+	const authorizationHash = "a".repeat(64);
+	const holding = session.executionHold.tryHoldForRestart("disk-failure", authorizationHash);
+	await expect(holding).rejects.toThrow("disk flush failed");
+	await expect(session.executionHold.tryHoldForRestart("disk-failure", authorizationHash)).rejects.toThrow(
+		"disk flush failed",
+	);
+	expect(session.executionHold.getState().status).toBe("holding");
+	expect(session.agent.peekFollowUpQueue()).toEqual([queued]);
+	expect(
+		manager
+			.getEntries()
+			.filter(entry => entry.type === "custom" && entry.customType === "owner-restart-parked-input"),
+	).toHaveLength(1);
+	await expect(session.prompt("must not bypass failed persistence")).rejects.toThrow("held");
+	expect(provider.calls).toHaveLength(0);
+});
+
+it("effective launch metadata uses session settings and native auto-approve precedence without exposing contents", () => {
+	const settings = Settings.isolated({ "tools.approvalMode": "always-ask", "tools.approval": { bash: "deny" } });
+	vi.spyOn(settings, "getAgentDir").mockReturnValue("/fixture/actual-settings");
+	const { session } = harness(undefined, undefined, undefined, false, {
+		settings,
+		agentDir: "/fixture/actual-agent",
+		autoApprove: true,
+	});
+	const metadata = session.executionHold.getLaunchMetadata();
+	expect(metadata.approvalMode).toBe("yolo");
+	expect(metadata.agentDir).toBe("/fixture/actual-agent");
+	expect(metadata.settingsHome).toBe("/fixture/actual-settings");
+	expect(Object.keys(metadata).sort()).toEqual([
+		"agentDir",
+		"approvalMode",
+		"effort",
+		"model",
+		"provider",
+		"settingsHome",
+	]);
+});
+
+it("native launch metadata follows live approval changes and fences staged inference on profile drift", async () => {
+	const temp = TempDir.createSync("@omp-restart-profile-");
+	cleanups.push(() => temp.removeSync());
+	const directory = fs.realpathSync(temp.path());
+	const settings = Settings.isolated({
+		"tools.approvalMode": "yolo",
+		"compaction.enabled": false,
+		"todo.enabled": false,
+	});
+	vi.spyOn(settings, "getAgentDir").mockReturnValue(directory);
+	const { session, provider } = harness(undefined, undefined, SessionManager.create(directory, directory), true, {
+		settings,
+		agentDir: directory,
+	});
+	const hash = "a".repeat(64);
+	const held = await session.executionHold.tryHoldForRestart("profile", hash);
+	if (!held) throw new Error("Fixture did not latch");
+	await session.executionHold.stageRestartContinuation("profile", hash, "bound continuation");
+	cfgToolsApprovalMode.override(settings, "always-ask-cached");
+	expect(session.executionHold.getLaunchMetadata().approvalMode).toBe("always-ask-cached");
+	await expect(session.executionHold.releaseRestartContinuation("profile", hash, held)).rejects.toThrow(
+		"launch profile changed",
+	);
+	expect(session.executionHold.getState().status).toBe("held");
+	expect(provider.calls).toHaveLength(0);
 });
