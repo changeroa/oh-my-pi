@@ -30,6 +30,7 @@ import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" wit
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import {
+	type ApprovalMode,
 	approvalRestrictions,
 	denyError,
 	resolveApproval,
@@ -481,6 +482,11 @@ export class SessionTools {
 	 */
 	#promptSurface: PromptSurface;
 	#acpPermissionDecisions = new Map<string, "allow_always" | "reject_always">();
+
+	/** Same effective selector used by tool execution, including explicit auto-approve. */
+	get approvalMode(): ApprovalMode {
+		return resolveApprovalFromContext({ autoApprove: this.#autoApprove, settings: this.#host.settings }).approvalMode;
+	}
 
 	constructor(host: SessionToolsHost, options: SessionToolsOptions) {
 		this.#host = host;

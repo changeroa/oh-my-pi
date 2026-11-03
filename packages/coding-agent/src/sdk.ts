@@ -648,6 +648,8 @@ export interface CreateAgentSessionOptions {
 	 * schedule background warm requests.
 	 */
 	cacheWarming?: boolean;
+	/** Start with native admission closed; trusted restart bootstrap adopts this latch. */
+	startExecutionHeld?: boolean;
 	/**
 	 * Per-family service tiers for this session, replacing the `tier.*` settings
 	 * and any persisted tier history. Called once the initial model is final —
@@ -4763,7 +4765,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				: new CacheWarmer({
 						stream: (model, context, streamOptions) => primaryStreamFn(model, context, streamOptions),
 						getPromptTokens: () => session.lastPromptTokens(),
-						getMode: () => cfgProvidersCacheWarming.get(settings),
+						getMode: () => session?.isExecutionHeld ? "off" : cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
@@ -5035,6 +5037,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
 			cacheWarmer,
+			agentDir,
+			startExecutionHeld: options.startExecutionHeld,
 			costGate: options.costGate,
 			advisorWatchdogPrompt,
 			advisorContextPrompt,

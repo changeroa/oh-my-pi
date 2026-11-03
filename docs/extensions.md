@@ -1419,3 +1419,73 @@ Use the right surface:
 - **Custom-tools** (`src/extensibility/custom-tools/*`): tool-focused modules; when loaded alongside extensions they are adapted and still pass through extension interception wrappers.
 
 If you need one package that owns policy, tools, command UX, and rendering together, use extensions.
+
+## Owner-coordinated native restart
+
+Main-TUI extensions can feature-detect three restart-only methods on
+`ctx.executionHold`: `tryHoldForRestart(operationId, authorizationHash)`,
+`stageRestartContinuation(operationId, authorizationHash, text)`, and
+`releaseRestartContinuation(operationId, authorizationHash, expectedHold)`.
+These are native mechanisms, not authorization policy. A trusted parent
+coordinator must authenticate the original owner source and bind its immutable
+hash, exact native controller, attachment epoch, and stable operation before
+calling them.
+
+`ctx.executionHold.getLaunchMetadata()` exposes only the effective SDK
+`agentDir`, effective `settingsHome`, resolved `approvalMode`, provider, model
+and effective thinking effort. The SDK retains its actual `agentDir` option;
+`settingsHome` reuses `Settings.getAgentDir()`, and permission resolution reuses
+the same native `resolveApprovalFromContext` path as tool execution, including
+explicit auto-approve precedence. It does not return settings, account secrets,
+provider internals or persona contents.
+
+The parent must pin this authenticated metadata before accepting an owner
+restart source. Never use managed-worker directory or approval defaults for a
+borrowed lead. If SDK and settings roots differ, the single native `--agent-dir`
+flag cannot reproduce that profile; reject before source consumption rather
+than guessing. Resume with the attested directory and original approval mode.
+The native latch captures this metadata and checks it after durable parking,
+staging and release persistence. Profile drift cannot open staged inference.
+
+
+Unlike `hold()`, `tryHoldForRestart()` never aborts a turn, cancels a tool, or
+stops a background job. It returns `null` while execution, admission,
+session transitions, async delivery, or host-owned work remains active. Once
+idle, it synchronously closes native admission, then persists complete queued
+input as `owner-restart-parked-input` custom audit data before resolving a
+held execution generation. Queues are not cleared to manufacture idleness.
+The audit entry is not a user delivery receipt and is not replayed on resume.
+New native IRC/deferred/launch-completion input is refused before acceptance
+while this restart latch is held; a parent service must retain its own newly
+accepted owner messages durably for the new attachment.
+
+A fresh resumed process must use native `--start-held` (SDK
+`startExecutionHeld: true`), which installs admission's holding generation in
+the constructor before startup work. `isRestartStartupHeld()` attests the
+unadopted fence; the restart extension adopts it before publishing a controller.
+`stageRestartContinuation()` appends and fsyncs exactly one real native user
+entry without inference; retries with changed content are rejected.
+`releaseRestartContinuation()` durably records its attempt, opens only the
+matching held generation, and synchronously claims inference on the staged
+entry before yielding. It does not submit a second user message or replay
+parked input. A lost release result is unknown, not permission to repeat it.
+The parent must separately verify provider inference and persona reads after
+reload; an attachment or input receipt proves neither.
+
+Structured terminal launchers can pass `--agent-dir /absolute/settings-home`
+and `--iyen-omp-bootstrap /absolute/private-bootstrap.json`. Both flags are
+extracted by the native CLI before runtime environment/extension loading.
+The fixed bare `--start-held` flag is mandatory for coordinated restart resume
+and cannot be shadowed by an extension. Cache warming respects the native held
+state without changing the configured warming policy.
+`--agent-dir` cannot be combined with `--profile` or `--alias`; conflicting
+bootstrap environment/flag values are rejected. An extension's `getFlag()`
+is populated too late to select its own factory bootstrap.
+
+Installing this source does not change an already-running native process.
+The first upgrade requires a normal local operator bootstrap and explicit
+attachment reconciliation. The documented local `/restart` command replaces
+the process image; it is not an authenticated remote upgrade API and is not
+the coordinator's exit-then-launch proof. Never remotely type commands,
+invoke arbitrary evaluation/debugger code, signal a guessed PID, or treat an
+old loaded controller as supporting these methods.

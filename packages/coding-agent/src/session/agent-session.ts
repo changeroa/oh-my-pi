@@ -171,6 +171,7 @@ import type {
 	ContextUsage,
 	ExecutionHoldState,
 	ExtensionExecutionHold,
+	NativeLaunchMetadata,
 } from "../extensibility/extensions/types";
 import type { CustomCommandContext } from "../extensibility/custom-commands/types";
 import { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -937,13 +938,35 @@ export class AgentSession implements SettingsScope {
 	#executionHoldState: ExecutionHoldState | undefined;
 	#executionHoldWork: Promise<ExecutionHoldState> | undefined;
 	#executionHoldCancellation = new AbortController();
+	#restartStartupFence = false;
 	#executionHoldBlockers = new Set<() => string | undefined>();
 	#sideExecutions = new Map<Promise<unknown>, AbortController>();
+	readonly #agentDir: string;
+	#restartHold: { operationId: string; authorizationHash: string; launchMetadata: NativeLaunchMetadata; work: Promise<ExecutionHoldState | null> } | undefined;
+	#restartStage: { textHash: string; work: Promise<{ entryId: string; textHash: string }>; release?: Promise<ExecutionHoldState> } | undefined;
 	readonly executionHold: ExtensionExecutionHold = {
+		getLaunchMetadata: () => {
+			const model = this.model;
+			if (!model) throw new Error("Native launch metadata requires an effective model");
+			return { agentDir: this.#agentDir, settingsHome: path.resolve(this.settings.getAgentDir()),
+				approvalMode: this.#tools.approvalMode, provider: model.provider, model: model.id, effort: this.thinkingLevel };
+		},
+		isRestartStartupHeld: () => this.#restartStartupFence && this.#getExecutionHoldState().status === "holding",
 		getState: () => this.#getExecutionHoldState(),
 		hold: () => this.#holdExecution(),
+		tryHoldForRestart: (operationId, authorizationHash) => this.#tryHoldForRestart(operationId, authorizationHash),
+		stageRestartContinuation: (operationId, authorizationHash, text) => this.#stageRestartContinuation(operationId, authorizationHash, text),
+		releaseRestartContinuation: (operationId, authorizationHash, expected) => this.#releaseRestartContinuation(operationId, authorizationHash, expected),
 		release: expected => this.#releaseExecution(expected),
 	};
+
+	#assertRestartLaunchMetadata(expected: NativeLaunchMetadata): void {
+		const current = this.executionHold.getLaunchMetadata();
+		if (current.agentDir !== expected.agentDir || current.settingsHome !== expected.settingsHome ||
+			current.approvalMode !== expected.approvalMode || current.provider !== expected.provider ||
+			current.model !== expected.model || current.effort !== expected.effort)
+			throw new Error("Native restart effective launch profile changed");
+	}
 
 	#getExecutionHoldState(): ExecutionHoldState {
 		const sessionId = this.sessionManager.getSessionId();
@@ -971,6 +994,144 @@ export class AgentSession implements SettingsScope {
 		return () => {
 			this.#executionHoldBlockers.delete(blocker);
 		};
+	}
+
+	#tryHoldForRestart(operationId: string, authorizationHash: string): Promise<ExecutionHoldState | null> {
+		if (!operationId || !/^[a-f0-9]{64}$/.test(authorizationHash))
+			throw new Error("Invalid restart authorization identity");
+		if (this.#restartStage?.release && this.#getExecutionHoldState().status === "open" &&
+			this.#restartHold?.operationId !== operationId) {
+			this.#restartHold = undefined;
+			this.#restartStage = undefined;
+		}
+		if (this.#restartHold) {
+			if (this.#restartHold.operationId !== operationId || this.#restartHold.authorizationHash !== authorizationHash)
+				throw new Error("Restart operation conflicts with the native execution latch");
+			return this.#restartHold.work;
+		}
+		// No await between the complete busy check and closing admission. Existing
+		// active work finishes normally; this path must NEVER call hold()/abort().
+		if (this.isBusyForSnapshot || this.hasAdmittedSubmission || this.isSessionTransitioning ||
+			this.getAsyncJobSnapshot()?.running.length || this.hasPendingAsyncWork() ||
+			this.#irc.hasPending() || this.yieldQueue.has() || this.#sideExecutions.size || this.#extensionRunner?.hasActiveExecution ||
+			this.#cacheWarmer?.status.state === "refreshing")
+			return Promise.resolve(null);
+		for (const blocker of this.#executionHoldBlockers) if (blocker()) return Promise.resolve(null);
+		const previous = this.#getExecutionHoldState();
+		if (previous.status !== "open" && !(this.#restartStartupFence && previous.status === "holding"))
+			throw new Error("Execution latch is owned by another operation");
+		if (!this.sessionManager.getSessionFile()) throw new Error("Owner restart requires a persistent local session");
+		const launchMetadata = this.executionHold.getLaunchMetadata();
+		const state: ExecutionHoldState = { ...previous, generation: this.#restartStartupFence ? previous.generation : previous.generation + 1, status: "holding" };
+		this.#restartStartupFence = false;
+		this.#executionHoldState = state;
+		const work = (async (): Promise<ExecutionHoldState> => {
+			// These are intentionally NOT user messages: restart never silently
+			// executes or relabels pending work. Preserve complete payloads privately
+			// in the native journal for explicit reconciliation after resume.
+			this.sessionManager.appendCustomEntry("owner-restart-parked-input", {
+				operationId, authorizationHash, sessionId: state.sessionId,
+				disposition: "parked-not-replayed",
+				steering: [...this.agent.peekSteeringQueue()],
+				followUp: [...this.agent.peekFollowUpQueue()],
+				undelivered: [...this.agent.peekUndeliveredQueuedMessages()],
+				nextTurn: [...this.#pendingNextTurnMessages],
+			});
+			await this.#syncRestartJournal();
+			this.#assertRestartLaunchMetadata(launchMetadata);
+			if (this.sessionManager.getSessionId() !== state.sessionId || this.isBusyForSnapshot ||
+				this.hasAdmittedSubmission || this.isSessionTransitioning)
+				throw new Error("Native restart fence changed during persistence");
+			const held: ExecutionHoldState = { ...state, status: "held" };
+			this.#executionHoldState = held;
+			return { ...held };
+		})();
+		this.#restartHold = { operationId, authorizationHash, launchMetadata, work };
+		return work;
+	}
+
+	async #syncRestartJournal(): Promise<void> {
+		await this.sessionManager.ensureOnDisk();
+		await this.sessionManager.flush();
+		const file = this.sessionManager.getSessionFile();
+		if (!file || !file.endsWith(".jsonl") || await fs.promises.realpath(file) !== file)
+			throw new Error("Owner restart requires a canonical local session journal");
+		const handle = await fs.promises.open(file, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+		try {
+			const before = await handle.stat();
+			if (!before.isFile() || process.getuid && before.uid !== process.getuid())
+				throw new Error("Owner restart journal ownership mismatch");
+			await handle.sync();
+			const named = await fs.promises.lstat(file), after = await handle.stat();
+			if (named.isSymbolicLink() || named.ino !== before.ino || named.dev !== before.dev ||
+				after.ino !== before.ino || after.dev !== before.dev || after.size !== before.size)
+				throw new Error("Owner restart journal changed while syncing");
+			const directory = await fs.promises.open(path.dirname(file), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+			try { await directory.sync(); } finally { await directory.close(); }
+		} finally { await handle.close(); }
+	}
+
+	#stageRestartContinuation(operationId: string, authorizationHash: string, text: string): Promise<{ entryId: string; textHash: string }> {
+		const hold = this.#restartHold;
+		if (!hold || hold.operationId !== operationId || hold.authorizationHash !== authorizationHash ||
+			this.#getExecutionHoldState().status !== "held")
+			throw new Error("Continuation requires exact held restart identity");
+		this.#assertRestartLaunchMetadata(hold.launchMetadata);
+		const textHash = new Bun.CryptoHasher("sha256").update(text).digest("hex");
+		if (this.#restartStage) {
+			if (this.#restartStage.textHash !== textHash) throw new Error("Restart continuation content conflict");
+			return this.#restartStage.work;
+		}
+		if (this.queuedMessageCount || this.#pendingNextTurnMessages.length || this.#irc.hasPending() || this.yieldQueue.has() ||
+			this.hasPendingAsyncWork() || this.isBusyForSnapshot || this.hasAdmittedSubmission || !this.sessionManager.getSessionFile())
+			throw new Error("Fresh restart requires persistent storage and no unexpected pending input");
+		const work = (async () => {
+			const message: UserMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+			const entryId = this.sessionManager.appendMessage(message);
+			if (!entryId) throw new Error("Restart continuation requires persistent native storage");
+			await this.#syncRestartJournal();
+			this.#assertRestartLaunchMetadata(hold.launchMetadata);
+			this.agent.appendMessage(message);
+			return { entryId, textHash };
+		})();
+		this.#restartStage = { textHash, work };
+		return work;
+	}
+
+	#releaseRestartContinuation(operationId: string, authorizationHash: string, expected: ExecutionHoldState): Promise<ExecutionHoldState> {
+		const hold = this.#restartHold, stage = this.#restartStage;
+		if (!hold || !stage || hold.operationId !== operationId || hold.authorizationHash !== authorizationHash)
+			throw new Error("No staged continuation for this restart");
+		if (stage.release) return stage.release;
+		const work = (async () => {
+			await stage.work;
+			this.#assertRestartLaunchMetadata(hold.launchMetadata);
+			const state = this.#getExecutionHoldState();
+			if (state.status !== "held" || state.sessionId !== expected.sessionId || state.generation !== expected.generation ||
+				this.isBusyForSnapshot || this.hasAdmittedSubmission || this.queuedMessageCount || this.hasPendingAsyncWork() || this.#irc.hasPending() || this.yieldQueue.has())
+				throw new Error("Restart continuation fence changed");
+			this.sessionManager.appendCustomEntry("owner-restart-continuation-release", {
+				operationId, authorizationHash, textHash: stage.textHash, disposition: "attempted",
+			});
+			await this.#syncRestartJournal();
+			this.#assertRestartLaunchMetadata(hold.launchMetadata);
+			if (this.#getExecutionHoldState().generation !== state.generation || this.#getExecutionHoldState().status !== "held" ||
+				this.queuedMessageCount || this.hasPendingAsyncWork() || this.#irc.hasPending() || this.yieldQueue.has())
+				throw new Error("Restart continuation changed during persistence");
+			// No await between opening admission and the agent's synchronous claim.
+			// No prompt append: exactly the already staged entry runs.
+			this.#executionHoldState = { ...state, status: "open" };
+			this.#executionHoldCancellation = new AbortController();
+			const running = this.agent.continue();
+			void running.catch(error => logger.error("Restart continuation failed", { error: String(error) }));
+			if (!this.agent.state.isStreaming) {
+				this.#executionHoldState = state;
+				throw new Error("Restart continuation did not claim native execution");
+			}
+			return this.#getExecutionHoldState();
+		})();
+		stage.release = work;
+		return work;
 	}
 
 	#holdExecution(): Promise<ExecutionHoldState> {
@@ -1032,6 +1193,8 @@ export class AgentSession implements SettingsScope {
 		const open: ExecutionHoldState = { ...state, status: "open" };
 		this.#executionHoldState = open;
 		this.#executionHoldCancellation = new AbortController();
+		this.#restartHold = undefined;
+		this.#restartStartupFence = false;
 		return { ...open };
 	}
 
@@ -2104,7 +2267,12 @@ export class AgentSession implements SettingsScope {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
+		if (config.startExecutionHeld) {
+			this.#restartStartupFence = true;
+			this.#executionHoldState = { sessionId: this.sessionManager.getSessionId(), generation: 1, status: "holding" };
+		}
 		this.settings = config.settings;
+		this.#agentDir = path.resolve(config.agentDir ?? this.settings.getAgentDir());
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
@@ -2168,6 +2336,10 @@ export class AgentSession implements SettingsScope {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			isDisposed: () => this.#isDisposed,
+			assertDeliveryAllowed: () => {
+				if (this.#restartHold && this.isExecutionHeld)
+					throw new Error("Owner restart has fenced native incoming delivery before acceptance");
+			},
 			isStreaming: () => this.isStreaming,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -10073,11 +10245,14 @@ export class AgentSession implements SettingsScope {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
+		if (this.#restartHold && this.isExecutionHeld) throw new Error("Owner restart fenced deferred input before acceptance");
 		this.#queueHiddenNextTurnMessage(message, true);
 	}
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
+		if (this.#restartHold && this.isExecutionHeld)
+			return Promise.reject(new Error("Owner restart fenced launch completion before acceptance"));
 		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
 			notification,

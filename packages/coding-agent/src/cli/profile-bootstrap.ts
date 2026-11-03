@@ -57,6 +57,8 @@ export interface ProfileBootstrapResult {
 	argv: string[];
 	profile?: string;
 	aliasName?: string;
+	agentDir?: string;
+	iyenOmpBootstrap?: string;
 }
 
 /**
@@ -78,6 +80,8 @@ export function extractProfileFlags(argv: readonly string[]): ProfileBootstrapRe
 	const stripped: string[] = [];
 	let profile: string | undefined;
 	let aliasName: string | undefined;
+	let agentDir: string | undefined;
+	let iyenOmpBootstrap: string | undefined;
 	let passThrough = false;
 	let sawSubcommand = false;
 	let canDispatchSubcommand = true;
@@ -103,6 +107,26 @@ export function extractProfileFlags(argv: readonly string[]): ProfileBootstrapRe
 		if (arg === "--") {
 			passThrough = true;
 			stripped.push(arg);
+			continue;
+		}
+
+		if (arg === "--agent-dir" || arg.startsWith("--agent-dir=")) {
+			const value = arg === "--agent-dir" ? argv[++index] : arg.slice("--agent-dir=".length);
+			if (!value || !value.startsWith("/") || value.includes("\0"))
+				throw new Error("--agent-dir requires an absolute directory");
+			if (agentDir !== undefined && agentDir !== value) throw new Error("Conflicting --agent-dir values");
+			agentDir = value;
+			insertBoundaryBeforeNextValue = needsBoundaryAfterGlobalStrip(stripped);
+			continue;
+		}
+
+		if (arg === "--iyen-omp-bootstrap" || arg.startsWith("--iyen-omp-bootstrap=")) {
+			const value = arg === "--iyen-omp-bootstrap" ? argv[++index] : arg.slice("--iyen-omp-bootstrap=".length);
+			if (!value || !value.startsWith("/") || value.includes("\0"))
+				throw new Error("--iyen-omp-bootstrap requires an absolute private bootstrap file");
+			if (iyenOmpBootstrap !== undefined && iyenOmpBootstrap !== value) throw new Error("Conflicting Iyen bootstrap flags");
+			iyenOmpBootstrap = value;
+			insertBoundaryBeforeNextValue = needsBoundaryAfterGlobalStrip(stripped);
 			continue;
 		}
 
@@ -225,5 +249,10 @@ export function extractProfileFlags(argv: readonly string[]): ProfileBootstrapRe
 		stripped.push(arg);
 	}
 
-	return { argv: stripped, profile, aliasName };
+	if (agentDir !== undefined && (profile !== undefined || aliasName !== undefined))
+		throw new Error("--agent-dir cannot be combined with --profile or --alias");
+	return { argv: stripped, profile, aliasName,
+		...(agentDir === undefined ? {} : { agentDir }),
+		...(iyenOmpBootstrap === undefined ? {} : { iyenOmpBootstrap }),
+	};
 }
