@@ -2021,7 +2021,7 @@ export class MCPCommandController {
 
 	async #promptSmitheryApiKey(promptLabel: string): Promise<string | null> {
 		for (;;) {
-			const input = await this.ctx.showHookInput(promptLabel);
+			const input = await this.ctx.showHookInput(promptLabel, undefined, { secret: true });
 			if (input === undefined) return null;
 			const apiKey = input.trim();
 			if (!apiKey) {

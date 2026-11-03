@@ -38,6 +38,7 @@ import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/age
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import { NativeInteractionBroker, type NativeUserInteractions } from "../../session/user-interactions";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
@@ -518,6 +519,10 @@ export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	userInteractions: NativeUserInteractions = new NativeInteractionBroker(
+		() => this.sessionId,
+		() => ({}),
+	);
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	/** Grant keys (see `sessionApprovalScope`) approved "for this session", each prefixed by the session it covers. */
@@ -1638,6 +1643,7 @@ export class ExtensionRunner {
 		const getExecutionHold = () => (agent.kind === "main" ? this.#executionHold : undefined);
 		return {
 			ui: this.#uiContext,
+			userInteractions: this.userInteractions,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),

@@ -6,6 +6,7 @@ import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { NativeInteractionBroker } from "../src/session/user-interactions";
 import { CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
@@ -73,6 +74,12 @@ function createControllerContext() {
 		requestRender: Mock<any>;
 	};
 	const ctx = {
+		session: {
+			userInteractions: new NativeInteractionBroker(
+				() => "hook-editor-test",
+				() => ({}),
+			),
+		},
 		editor,
 		editorContainer,
 		ui,

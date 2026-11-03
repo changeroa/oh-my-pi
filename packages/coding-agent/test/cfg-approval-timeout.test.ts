@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { CfgProtocolHandler, setCfgApprovalHost } from "@oh-my-pi/pi-coding-agent/internal-urls/cfg-protocol";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { type MCPAuthHandler, MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -70,6 +71,7 @@ describe("cfg:// approval prompt wiring", () => {
 	async function startMode(
 		askTimeout: number | undefined,
 		mcpManager?: MCPManager,
+		nativeSelector = false,
 	): Promise<Array<number | undefined>> {
 		testSession = await createTestSession(
 			askTimeout === undefined ? {} : { settingsOverrides: { "ask.timeout": askTimeout } },
@@ -92,22 +94,23 @@ describe("cfg:// approval prompt wiring", () => {
 		spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		spyOn(mode, "showHookConfirm").mockResolvedValue(true);
 		const seen: Array<number | undefined> = [];
-		spyOn(ExtensionUiController.prototype, "showCollabAwareSelector").mockImplementation(
-			async (_title: string, _options: unknown, dialogOptions?: { timeout?: number; signal?: AbortSignal }) => {
-				seen.push(dialogOptions?.timeout);
-				// Mirror the real dialog: a pre-aborted signal settles dismissed
-				// without presenting; otherwise wait for the abort like a user
-				// dismissal that only arrives via stop().
-				if (dialogOptions?.signal?.aborted) return undefined;
-				if (hangSelector) {
-					const { promise, resolve } = Promise.withResolvers<undefined>();
-					dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
-					await promise;
-					return undefined;
-				}
-				return "Allow once";
-			},
-		);
+		if (!nativeSelector)
+			spyOn(ExtensionUiController.prototype, "showCollabAwareSelector").mockImplementation(
+				async (_title: string, _options: unknown, dialogOptions?: { timeout?: number; signal?: AbortSignal }) => {
+					seen.push(dialogOptions?.timeout);
+					// Mirror the real dialog: a pre-aborted signal settles dismissed
+					// without presenting; otherwise wait for the abort like a user
+					// dismissal that only arrives via stop().
+					if (dialogOptions?.signal?.aborted) return undefined;
+					if (hangSelector) {
+						const { promise, resolve } = Promise.withResolvers<undefined>();
+						dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+						await promise;
+						return undefined;
+					}
+					return "Allow once";
+				},
+			);
 		await mode.init({ suppressWelcomeIntro: true });
 		seen.length = 0;
 		return seen;
@@ -137,6 +140,28 @@ describe("cfg:// approval prompt wiring", () => {
 		};
 		return new CfgProtocolHandler().write(parseInternalUrl("cfg://advisor/enabled"), "true", { session, signal });
 	}
+
+	it("applies a cfg write only after the exact real native settings dialog is answered", async () => {
+		await startMode(undefined, undefined, true);
+		const interactions = testSession!.session.userInteractions;
+		const opened = Promise.withResolvers<void>();
+		const emit = interactions.emit;
+		spyOn(interactions, "emit").mockImplementation(event => {
+			emit(event);
+			if (event.type === "user_interaction_requested") opened.resolve();
+		});
+		const write = driveWrite();
+		await opened.promise;
+		const request = interactions.list()[0]!;
+		expect(request.kind).toBe("select");
+		const once = request.options?.find(option => option.label === "Allow once");
+		if (!once) throw new Error("Native settings dialog did not offer one-change approval");
+		const receipt = await interactions.respond(request.id, { kind: "submit", choice: once.id }, "cfg-owner-answer");
+		expect(receipt.status).toBe("applied");
+		expect(outcomeOf(await write)).toBe("applied");
+		expect(cfgAdvisorEnabled.get(testSession!.session.settings)).toBe(true);
+		expect(interactions.list()).toEqual([]);
+	}, 60_000);
 
 	it("prompts without a deadline when ask.timeout is at its default", async () => {
 		// Regression for #15080: the prompt used a hardcoded 10s deadline.

@@ -11,6 +11,7 @@ import { ExtensionUiController } from "../../../src/modes/controllers/extension-
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../../src/modes/types";
+import { NativeInteractionBroker } from "../../../src/session/user-interactions";
 
 afterEach(() => {
 	setKeybindings(KeybindingsManager.inMemory());
@@ -58,6 +59,10 @@ function makeHarness() {
 		},
 		editorContainer,
 		session: {
+			userInteractions: new NativeInteractionBroker(
+				() => "extension-ui-test",
+				() => ({}),
+			),
 			agent,
 			extensionRunner: undefined,
 			setUsageFallbackConfirmer: vi.fn(),

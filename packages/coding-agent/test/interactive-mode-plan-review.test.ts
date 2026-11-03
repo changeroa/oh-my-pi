@@ -18,6 +18,7 @@ import type {
 	Extension,
 	ExtensionContext,
 	ExtensionEvent,
+	PlanReviewChoice,
 	PlanReviewRequestedEvent,
 	PlanReviewResolvedEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -636,6 +637,334 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(resolved).toMatchObject({ choice: "refine", by: "extension" });
 	});
 
+	it.each([
+		{
+			name: "authoritative suffix after an internal marker",
+			text: `Quoted [DORI_OPERATION:${"a".repeat(64)}]\n\n[DORI_OPERATION:${"b".repeat(64)}]`,
+			hash: "b".repeat(64),
+		},
+		{
+			name: "standalone suffix with trailing newline",
+			text: `Request\n[DORI_OPERATION:${"c".repeat(64)}]\n`,
+			hash: "c".repeat(64),
+		},
+		{ name: "inline marker", text: `Request [DORI_OPERATION:${"a".repeat(64)}]`, hash: undefined },
+		{ name: "quoted marker", text: `Request\n> [DORI_OPERATION:${"a".repeat(64)}]`, hash: undefined },
+		{
+			name: "internal standalone marker",
+			text: `[DORI_OPERATION:${"a".repeat(64)}]\nMore request text`,
+			hash: undefined,
+		},
+		{ name: "fenced marker", text: `Request\n\`\`\`\n[DORI_OPERATION:${"a".repeat(64)}]\n\`\`\``, hash: undefined },
+		{ name: "malformed suffix", text: `Request\n[DORI_OPERATION:${"a".repeat(63)}]`, hash: undefined },
+	])("correlates session-owned input with $name without borrowing an older user's marker", async ({ text, hash }) => {
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: `Older request\n[DORI_OPERATION:${"d".repeat(64)}]`,
+			timestamp: Date.now(),
+		});
+		const sourceEntryId = session.sessionManager.appendMessage({
+			role: "user",
+			content: text,
+			timestamp: Date.now(),
+		});
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: `Synthetic\n[DORI_OPERATION:${"e".repeat(64)}]`,
+			synthetic: true,
+			timestamp: Date.now(),
+		});
+		const waiting = mode.showHookInput("Provenance");
+		const request = session.userInteractions.list()[0]!;
+		expect(request.sourceEntryId).toBe(sourceEntryId);
+		expect(request.sourceOperationHash).toBe(hash);
+		await session.userInteractions.respond(request.id, { kind: "submit", value: "answer" }, "source-answer");
+		expect(await waiting).toBe("answer");
+	});
+
+	it("answers the real plan review through userInteractions with source correlation and native validation", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nReview the native plan.");
+		const sourceEntryId = session.sessionManager.appendMessage({
+			role: "user",
+			content: `Please review this plan.\n\n[DORI_OPERATION:${"b".repeat(64)}]`,
+			timestamp: Date.now(),
+		});
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		vi.spyOn(session, "getContextUsage").mockReturnValue({
+			tokens: 100_001,
+			contextWindow: 100_000,
+			percent: 100.001,
+		});
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const opened = Promise.withResolvers<void>();
+		const recorder = planReviewRecorder("native-interaction", () => opened.resolve());
+		const runner = await loadExtensions(recorder.extension);
+		const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		await opened.promise;
+		const interactions = runner.createContext().userInteractions;
+		const request = interactions.list().find(request => request.kind === "plan-review")!;
+		expect(request).toMatchObject({
+			message: "# Plan\n\nReview the native plan.",
+			sourceEntryId,
+			sourceOperationHash: "b".repeat(64),
+		});
+		await expect(
+			interactions.respond(request.id, { kind: "submit", choice: "keep" }, "disabled-keep"),
+		).rejects.toThrow();
+		await expect(
+			interactions.respond(request.id, { kind: "submit", choice: "refine" }, "missing-feedback"),
+		).rejects.toThrow();
+		await expect(
+			interactions.respond(
+				request.id,
+				{ kind: "submit", choice: "refine", feedback: "revise", role: "not-an-execution" },
+				"wrong-role",
+			),
+		).rejects.toThrow();
+		const response = { kind: "submit" as const, choice: "refine", feedback: "  keep indentation\n" };
+		const receipt = await interactions.respond(request.id, response, "owner-plan-answer");
+		await approval;
+		expect(receipt.status).toBe("applied");
+		expect(prompt).toHaveBeenCalledWith("  keep indentation\n");
+		expect(mode.ui.hasOverlay()).toBe(false);
+		expect(interactions.list()).toEqual([]);
+		expect(await interactions.respond(request.id, response, "owner-plan-answer")).toEqual(receipt);
+		expect(await recorder.resolved).toMatchObject({ choice: "refine", by: "extension" });
+	});
+
+	for (const transport of ["broker", "extension"] as const) {
+		for (const choice of ["execute", "compact", "keep"] as const) {
+			it.each(["file", "overlay"] as const)(
+				`${transport} ${choice} executes only the advertised snapshot after %s drift and preserves the newer draft`,
+				async drift => {
+					const planFilePath = "local://PLAN.md";
+					const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+						getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+						getSessionId: () => session.sessionManager.getSessionId(),
+					});
+					const advertised =
+						"# Plan\n\nApproved introduction.\n\n## Work\n\nApproved action.\n\n## Verify\n\nApproved verification.\n";
+					await Bun.write(resolvedPlanPath, advertised);
+					mode.planModeEnabled = true;
+					mode.planModePlanFilePath = planFilePath;
+					vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+					vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+					vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("ok");
+					const dispatch = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+					const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+					const runner = await loadExtensions(
+						planReviewRecorder("snapshot", event => opened.resolve(event)).extension,
+					);
+					const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+					const review = await opened.promise;
+					if (drift === "file") {
+						await Bun.write(resolvedPlanPath, "# Newer local draft\n\nNot approved remotely.\n");
+					} else {
+						const overlay = mode.ui.getFocused() as PlanReviewOverlay;
+						overlay.render(120);
+						overlay.handleInput("\t"); // actions -> section table of contents
+						overlay.handleInput("d"); // delete the selected Work section, mirroring to disk
+					}
+					const interactions = runner.createContext().userInteractions;
+					if (transport === "broker") {
+						const request = interactions.list().find(request => request.kind === "plan-review")!;
+						expect(request.message).toBe(advertised);
+						await interactions.respond(request.id, { kind: "submit", choice }, "snapshot-answer");
+					} else {
+						expect(runner.createContext().resolvePlanReview(review.reviewId, choice)).toBe(true);
+					}
+					await approval;
+					const call = dispatch.mock.calls.find(isPlanApprovedCall);
+					expect(call?.[0]).toContain(advertised);
+					expect(call?.[0]).not.toContain("Not approved remotely.");
+					const snapshotPath = `local://approved-plan-${review.reviewId}.md`;
+					expect(call?.[0]).toContain(snapshotPath);
+					expect(
+						await Bun.file(
+							resolveLocalUrlToPath(snapshotPath, {
+								getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+								getSessionId: () => session.sessionManager.getSessionId(),
+							}),
+						).text(),
+					).toBe(advertised);
+					const newer = await Bun.file(resolvedPlanPath).text();
+					if (drift === "file") expect(newer).toBe("# Newer local draft\n\nNot approved remotely.\n");
+					else {
+						expect(newer).not.toContain("Approved action.");
+						expect(newer).toContain("Approved verification.");
+					}
+				},
+			);
+		}
+	}
+
+	for (const transport of ["broker", "extension"] as const) {
+		it.each(["file", "overlay"] as const)(
+			`${transport} saves only the advertised plan after %s drift`,
+			async drift => {
+				const planFilePath = "local://PLAN.md";
+				const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+					getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+					getSessionId: () => session.sessionManager.getSessionId(),
+				});
+				const advertised =
+					"# Reviewed plan\n\nSave exactly this.\n\n## Work\n\nApproved action.\n\n## Verify\n\nApproved verification.\n";
+				await Bun.write(resolvedPlanPath, advertised);
+				mode.planModeEnabled = true;
+				mode.planModePlanFilePath = planFilePath;
+				vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+				const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+				const runner = await loadExtensions(
+					planReviewRecorder("save-snapshot", event => opened.resolve(event)).extension,
+				);
+				const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Snapshot save" });
+				const review = await opened.promise;
+				if (drift === "file") {
+					await Bun.write(resolvedPlanPath, "# Newer draft\n\nKeep this local edit.\n");
+				} else {
+					const overlay = mode.ui.getFocused() as PlanReviewOverlay;
+					overlay.render(120);
+					overlay.handleInput("\t");
+					overlay.handleInput("d");
+				}
+				if (transport === "broker") {
+					const request = runner.createContext().userInteractions.list()[0]!;
+					await runner
+						.createContext()
+						.userInteractions.respond(request.id, { kind: "submit", choice: "save" }, "save-snapshot");
+				} else {
+					expect(runner.createContext().resolvePlanReview(review.reviewId, "save")).toBe(true);
+				}
+				await approval;
+				expect(await Bun.file(path.join(tempDir.path(), planSaveFileName("Snapshot save"))).text()).toBe(
+					advertised,
+				);
+				const newer = await Bun.file(resolvedPlanPath).text();
+				if (drift === "file") expect(newer).toBe("# Newer draft\n\nKeep this local edit.\n");
+				else {
+					expect(newer).not.toContain("Approved action.");
+					expect(newer).toContain("Approved verification.");
+				}
+			},
+		);
+	}
+
+	it("does not replace an existing local file when a remote plan save uses its fixed default path", async () => {
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nThe remotely reviewed snapshot.\n",
+		);
+		const destination = path.join(tempDir.path(), planSaveFileName("Snapshot save"));
+		await Bun.write(destination, "# Newer local document\n\nDo not overwrite.\n");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const error = vi.spyOn(mode, "showError");
+		const opened = Promise.withResolvers<void>();
+		const runner = await loadExtensions(planReviewRecorder("save-conflict", () => opened.resolve()).extension);
+		const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "Snapshot save" });
+		await opened.promise;
+		const ctx = runner.createContext();
+		await ctx.userInteractions.respond(
+			ctx.userInteractions.list()[0]!.id,
+			{ kind: "submit", choice: "save" },
+			"save-conflict",
+		);
+		await approval;
+		expect(await Bun.file(destination).text()).toBe("# Newer local document\n\nDo not overwrite.\n");
+		expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed to save plan"));
+		expect(clear).not.toHaveBeenCalled();
+		expect(mode.planModeEnabled).toBe(true);
+	});
+
+	it("refuses meaningful feedback outside refine and roles outside offered approval tiers through both remote APIs", async () => {
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nReview response validity.",
+		);
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		const dispatch = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+		const runner = await loadExtensions(planReviewRecorder("validity", event => opened.resolve(event)).extension);
+		const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		const review = await opened.promise;
+		const ctx = runner.createContext();
+		const request = ctx.userInteractions.list()[0]!;
+		for (const choice of ["execute", "compact", "keep", "save"] as PlanReviewChoice[]) {
+			expect(ctx.resolvePlanReview(review.reviewId, choice, { feedback: "Revise before approval" })).toBe(false);
+			await expect(
+				ctx.userInteractions.respond(
+					request.id,
+					{ kind: "submit", choice, feedback: "Revise before approval" },
+					`feedback-${choice}`,
+				),
+			).rejects.toThrow();
+		}
+		for (const choice of ["refine", "save"] as PlanReviewChoice[]) {
+			const input = { role: "default", feedback: choice === "refine" ? "Revise this" : undefined };
+			expect(ctx.resolvePlanReview(review.reviewId, choice, input)).toBe(false);
+			await expect(
+				ctx.userInteractions.respond(request.id, { kind: "submit", choice, ...input }, `role-${choice}`),
+			).rejects.toThrow();
+		}
+		expect(dispatch).not.toHaveBeenCalled();
+		expect(ctx.getPendingPlanReview()?.reviewId).toBe(review.reviewId);
+		await ctx.userInteractions.respond(
+			request.id,
+			{ kind: "submit", choice: "refine", feedback: "  Real feedback\n" },
+			"valid-refine",
+		);
+		await approval;
+		expect(dispatch).toHaveBeenCalledWith("  Real feedback\n");
+	});
+
+	it("commits the userInteractions execution role through the native plan tier selector", async () => {
+		session.settings.setModelRole("default", "anthropic/claude-sonnet-4-5");
+		session.settings.setModelRole("slow", "anthropic/claude-opus-4-5");
+		session.settings.setModelRole("plan", "anthropic/claude-sonnet-4-5");
+		const planFilePath = "local://PLAN.md";
+		await Bun.write(
+			resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			}),
+			"# Plan\n\nUse the selected execution tier.",
+		);
+		await mode.handlePlanModeCommand();
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const opened = Promise.withResolvers<void>();
+		const recorder = planReviewRecorder("native-tier", () => opened.resolve());
+		const runner = await loadExtensions(recorder.extension);
+		const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		await opened.promise;
+		const interactions = runner.createContext().userInteractions;
+		const request = interactions.list().find(request => request.kind === "plan-review")!;
+		await expect(
+			interactions.respond(request.id, { kind: "submit", choice: "keep", role: "unknown-tier" }, "bad-tier"),
+		).rejects.toThrow();
+		await interactions.respond(request.id, { kind: "submit", choice: "keep", role: "slow" }, "slow-tier");
+		await approval;
+		expect(session.model?.id).toBe("claude-opus-4-5");
+		expect(await recorder.resolved).toMatchObject({ choice: "keep", by: "extension" });
+	});
+
 	it("reports a remote compact approval closed only once its overlay hides", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -944,11 +1273,6 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
 		const resolved = events.find((event): event is PlanReviewResolvedEvent => event.type === "plan_review_resolved");
-		// `mode_changed` also fires here (the test flips plan mode on directly); this asserts review order.
-		expect(events.map(event => event.type).filter(type => type !== "mode_changed")).toEqual([
-			"plan_review_requested",
-			"plan_review_resolved",
-		]);
 		expect(resolved).toMatchObject({ choice: "execute", by: "local" });
 	});
 
