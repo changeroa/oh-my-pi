@@ -478,6 +478,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			let approved: boolean;
 			try {
 				const answer = await requestApproval(uiContext, this.tool, resolvedArgs, {
+					toolCallId,
+					signal,
 					reason: approvalCheck.reason,
 					appendix: safetyAppendix,
 					sessionSubject: sessionScope?.subject,

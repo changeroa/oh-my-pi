@@ -4,6 +4,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { validateInteractionResponse } from "../session/user-interaction-responses";
 import { type Agent, AgentBusyError, type AgentMessage, agentPauseGate, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
@@ -6185,6 +6186,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			initialIndex?: number;
 			/** Called once, with the settled choice, when the review overlay is hidden. */
 			onClose?: (choice: string | undefined) => void;
+			/** Native broker observes the same synchronous winning pick, before Promise continuations. */
+			onPick?: (choice: string | undefined) => void;
 		},
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
@@ -6203,6 +6206,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#planReviewPick = undefined;
 			}
 			if (pending && this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
+			dialogOptions?.onPick?.(choice);
 			resolve(choice);
 		};
 		this.#planReviewOwner = owner;
@@ -6268,10 +6272,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Answers the open plan review as if the operator picked `choice`: backs `ctx.resolvePlanReview`.
-	 * Refine feedback is sent verbatim; it only has to be non-blank. `input.role` moves an
-	 * approval's execution-tier selection before the pick; it is refused when it names no tier
-	 * or accompanies a non-approval choice.
+	 * Answers the published plan review snapshot: backs `ctx.resolvePlanReview`.
+	 * Refine feedback is sent verbatim; meaningful feedback is refused on other
+	 * choices. `input.role` moves an approval's execution-tier selection before
+	 * the pick; unknown tiers and roles on non-approval choices are refused.
 	 */
 	resolvePlanReview(
 		reviewId: string,
@@ -6284,6 +6288,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		const option = pending.request.options.find(item => item.id === choice);
 		if (!option || option.disabled) return false;
 		const feedback = input?.feedback;
+		if (feedback !== undefined && typeof feedback !== "string") return false;
+		if (choice !== "refine" && feedback?.trim()) return false;
 		if (choice === "refine" && !feedback?.trim()) return false;
 		if (input?.role !== undefined) {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
@@ -6439,7 +6445,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		try {
-			await Bun.write(destination, planContent);
+			// Remote save targets are fixed, not confirmed by the local save dialog.
+			// Never replace a pre-existing file on that path.
+			if (presetPath) await fs.writeFile(destination, planContent, { flag: "wx" });
+			else await Bun.write(destination, planContent);
 		} catch (error) {
 			this.showError(
 				`Failed to save plan to ${shortenPath(destination)}: ${error instanceof Error ? error.message : String(error)}`,
@@ -7605,11 +7614,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// leave it up (compaction runs behind it), and it only fires once every
 		// extension has been handed `plan_review_requested`.
 		const requestDelivered = Promise.withResolvers<void>();
+		let settleNativeChoice: ((choice: string | undefined) => void) | undefined;
 		const choicePromise = this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
 			reviewOptions.map(option => option.label),
 			{
+				onPick: choice => settleNativeChoice?.(choice),
 				helpText,
 				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
 				onPlanEdited: content => {
@@ -7639,6 +7650,38 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 			{ slider },
 		);
+		const nativeChoicePromise = this.session.userInteractions.run<string | undefined>(
+			{
+				kind: "plan-review",
+				title: request.title,
+				message: request.planContent,
+				options: request.options,
+				tiers: request.tiers,
+			},
+			(signal, settle) => {
+				settleNativeChoice = settle;
+				const cancel = () => this.#hidePlanReview(pending);
+				signal.addEventListener("abort", cancel, { once: true });
+				return choicePromise.finally(() => signal.removeEventListener("abort", cancel));
+			},
+			response => {
+				validateInteractionResponse(response, ["choice", "feedback", "role"]);
+				if (response.kind === "cancel") return undefined;
+				if (response.feedback !== undefined && typeof response.feedback !== "string")
+					throw new Error("Plan feedback must be text");
+				if (response.role !== undefined && typeof response.role !== "string")
+					throw new Error("Plan tier role must be text");
+				const option = request.options.find(option => option.id === response.choice);
+				if (
+					!option ||
+					!this.resolvePlanReview(reviewId, option.id, { feedback: response.feedback, role: response.role })
+				)
+					throw new Error("Plan choice is unavailable or requires feedback/a valid execution tier");
+				return option.label;
+			},
+			undefined,
+			this.#dialogLifetime.signal,
+		);
 		options?.onOpened?.();
 		// Handlers get their own copy so mutating the event cannot re-enable a refused choice.
 		const requestedDelivery = extensionRunner?.emit(structuredClone(request));
@@ -7646,7 +7689,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			() => requestDelivered.resolve(),
 			() => requestDelivered.resolve(),
 		);
-		const choice = await choicePromise;
+		const choice = await nativeChoicePromise;
 		if (this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
 		const remote = pending.remote;
 		const closePlanReview = (): void => {
@@ -7657,7 +7700,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (choice === PLAN_SAVE_AND_QUIT_OPTION) {
 			closePlanReview();
 			try {
-				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
+				const latestPlanContent = remote
+					? planContent
+					: (editedContent ?? (await this.#readPlanFile(planFilePath)));
 				if (latestPlanContent === null) {
 					this.showError(`Plan file not found at ${planFilePath}`);
 					return;
@@ -7676,11 +7721,16 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
 			try {
-				// Prefer in-overlay edits (already in memory) over a disk re-read. The
-				// overlay mirrors edits as they happen, and approval awaits one final
-				// write so the durable plan file and synthetic prompt carry the same text.
-				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
-				if (editedContent !== undefined) {
+				// Remote approval authorizes only the published snapshot, never unseen
+				// overlay/disk edits. Give it its own durable reference; leave the live
+				// draft untouched even when clear/compact later reads the approved plan.
+				const latestPlanContent = remote
+					? planContent
+					: (editedContent ?? (await this.#readPlanFile(planFilePath)));
+				const approvedPlanFilePath = remote ? `local://approved-plan-${reviewId}.md` : planFilePath;
+				if (remote) {
+					await Bun.write(this.#resolvePlanFilePath(approvedPlanFilePath), planContent);
+				} else if (editedContent !== undefined) {
 					await Bun.write(this.#resolvePlanFilePath(planFilePath), editedContent);
 				}
 				if (!latestPlanContent) {
@@ -7717,7 +7767,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				const executionModel =
 					slider && cycle && selectedTierIndex !== restoredIndex ? cycle.models[selectedTierIndex] : undefined;
 				const executionDispatched = await this.#approvePlan(latestPlanContent, {
-					planFilePath,
+					planFilePath: approvedPlanFilePath,
 					title: details.title,
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
@@ -7866,6 +7916,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		this.syncIdleMaintenanceView(null);
 		this.#hidePlanReview();
+		this.session.userInteractions.invalidate();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
 		// controller stays aborted: approvals still queued behind the approval
@@ -8873,6 +8924,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async prepareSessionSwitch(): Promise<void> {
+		this.session.userInteractions.invalidate();
 		this.#clearJudgmentBatchProgress(true);
 		await this.#btwController.dispose();
 		this.#omfgController.dispose();
@@ -9566,8 +9618,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.hideHookSelector();
 	}
 
-	showHookInput(title: string, placeholder?: string): Promise<string | undefined> {
-		return this.#extensionUiController.showHookInput(title, placeholder);
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookInput(title, placeholder, dialogOptions);
 	}
 
 	hideHookInput(): void {

@@ -51,6 +51,13 @@ import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
 import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
+import {
+	nativeAskResponse,
+	nativeChoiceResponse,
+	nativeConfirmResponse,
+	nativeTextResponse,
+} from "../../session/user-interaction-responses";
+import type { NativeInteractionDraft, NativeUserInteractionResponse } from "../../session/user-interactions";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -134,6 +141,169 @@ export class ExtensionUiController {
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
+	#nativeLocalSettlers = new WeakMap<AbortSignal, (value: unknown) => void>();
+
+	#inheritNativeSignal(parent: AbortSignal | undefined, signal: AbortSignal): AbortSignal {
+		const settle = parent && this.#nativeLocalSettlers.get(parent);
+		if (settle) this.#nativeLocalSettlers.set(signal, settle);
+		return signal;
+	}
+
+	#nativeDialog<T>(
+		draft: NativeInteractionDraft,
+		options: ExtensionUIDialogOptions | undefined,
+		local: (signal: AbortSignal) => Promise<T>,
+		decode: (response: NativeUserInteractionResponse) => T,
+		cancelled: T,
+		fromLocal: (value: unknown) => T = value => value as T,
+	): Promise<T> {
+		if (options?.signal && this.#nativeLocalSettlers.has(options.signal)) return local(options.signal);
+		return this.ctx.session.userInteractions.run(
+			draft,
+			(signal, settle) => {
+				this.#nativeLocalSettlers.set(signal, value => settle(fromLocal(value)));
+				return local(signal).finally(() => this.#nativeLocalSettlers.delete(signal));
+			},
+			decode,
+			cancelled,
+			options?.signal,
+		);
+	}
+
+	showCollabAwareSelector(
+		title: string,
+		options: ExtensionUISelectItem[],
+		dialogOptions?: InteractiveSelectorDialogOptions,
+		extra?: { slider?: HookSelectorSlider },
+	): Promise<string | undefined> {
+		const choices = options.map((option, index) => ({
+			...(typeof option === "string" ? { label: option } : option),
+			id: String(index),
+			disabled: dialogOptions?.disabledIndices?.includes(index),
+		}));
+		return this.#nativeDialog(
+			{ kind: "select", title, options: choices },
+			dialogOptions,
+			signal => this.#showCollabAwareSelector(title, options, { ...dialogOptions, signal }, extra),
+			response => {
+				const id = nativeChoiceResponse(response, choices);
+				return choices.find(choice => choice.id === id)?.label;
+			},
+			undefined,
+		);
+	}
+
+	showHookSelector(
+		title: string,
+		options: ExtensionUISelectItem[],
+		dialogOptions?: InteractiveSelectorDialogOptions,
+		extra?: { slider?: HookSelectorSlider },
+	): Promise<string | undefined> {
+		const choices = options.map((option, index) => ({
+			...(typeof option === "string" ? { label: option } : option),
+			id: String(index),
+			disabled: dialogOptions?.disabledIndices?.includes(index),
+		}));
+		return this.#nativeDialog(
+			{ kind: "select", title, options: choices },
+			dialogOptions,
+			signal => this.#showHookSelector(title, options, { ...dialogOptions, signal }, extra),
+			response => {
+				const id = nativeChoiceResponse(response, choices);
+				return choices.find(choice => choice.id === id)?.label;
+			},
+			undefined,
+		);
+	}
+
+	showCollabAwareEditor(
+		title: string,
+		prefill?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+		editorOptions?: { promptStyle?: boolean },
+	): Promise<string | undefined> {
+		return this.#nativeDialog(
+			{ kind: "editor", title, defaultValue: prefill },
+			dialogOptions,
+			signal => this.#showCollabAwareEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
+			nativeTextResponse,
+			undefined,
+		);
+	}
+
+	showHookEditor(
+		title: string,
+		prefill?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+		editorOptions?: { promptStyle?: boolean },
+	): Promise<string | undefined> {
+		return this.#nativeDialog(
+			{ kind: "editor", title, defaultValue: prefill },
+			dialogOptions,
+			signal => this.#showHookEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
+			nativeTextResponse,
+			undefined,
+		);
+	}
+
+	showHookInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#nativeDialog(
+			{ kind: "input", title, placeholder, secret: dialogOptions?.secret },
+			dialogOptions,
+			signal => this.#showHookInput(title, placeholder, { ...dialogOptions, signal }),
+			nativeTextResponse,
+			undefined,
+		);
+	}
+
+	showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined> {
+		const normalized = normalizeDialogQuestions(questions);
+		return this.#nativeDialog(
+			{ kind: "ask", title: "Questions", questions: normalized },
+			dialogOptions,
+			signal => this.#showAskDialog(normalized, { ...dialogOptions, signal }),
+			response => nativeAskResponse(normalized, response),
+			undefined,
+		);
+	}
+
+	showCollabAwareApproval(
+		prompt: ExtensionApprovalPrompt,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionApprovalAnswer> {
+		prompt = structuredClone(prompt);
+		const choices = [
+			...(prompt.grants ?? []).map(grant => ({ id: `grant:${grant.scope}:once`, label: grant.label })),
+			...(prompt.grants ?? []).map(grant => ({ id: `grant:${grant.scope}:always`, label: grant.alwaysLabel })),
+			{ id: "once", label: approvalOnceLabel(prompt) },
+			...(prompt.session ? [{ id: "session", label: prompt.session }] : []),
+			{ id: "deny", label: "Deny" },
+		];
+		return this.#nativeDialog(
+			{
+				kind: "approval",
+				title: prompt.compact,
+				message: prompt.full,
+				options: choices,
+				toolCallId: prompt.toolCallId,
+			},
+			dialogOptions,
+			signal => this.#showCollabAwareApproval(prompt, { ...dialogOptions, signal }),
+			response => {
+				const id = nativeChoiceResponse(response, choices);
+				return approvalAnswerForChoice(prompt, choices.find(choice => choice.id === id)?.label);
+			},
+			"deny",
+			value => approvalAnswerForChoice(prompt, value as string | undefined),
+		);
+	}
 
 	#syncExtensionComposerShapes(): void {
 		this.disposeComposerShapes();
@@ -243,6 +413,7 @@ export class ExtensionUiController {
 		});
 
 		const extensionRunner = this.ctx.session.extensionRunner;
+		if (extensionRunner) extensionRunner.userInteractions = this.ctx.session.userInteractions;
 		this.#syncExtensionComposerShapes();
 		if (!extensionRunner) {
 			return; // No hooks loaded
@@ -481,6 +652,7 @@ export class ExtensionUiController {
 		if (!extensionRunner) {
 			return;
 		}
+		extensionRunner.userInteractions = this.ctx.session.userInteractions;
 
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
@@ -665,7 +837,7 @@ export class ExtensionUiController {
 		this.ctx.ui.requestRender();
 	}
 
-	async showCollabAwareSelector(
+	async #showCollabAwareSelector(
 		title: string,
 		options: ExtensionUISelectItem[],
 		dialogOptions?: InteractiveSelectorDialogOptions,
@@ -686,7 +858,7 @@ export class ExtensionUiController {
 		);
 	}
 
-	async showCollabAwareEditor(
+	async #showCollabAwareEditor(
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
@@ -710,7 +882,7 @@ export class ExtensionUiController {
 	 * the call, so the message tells the agent why instead of a bare denial. The watch starts with
 	 * the request, so approvals still queued behind another dialog are denied by the same message.
 	 */
-	async showCollabAwareApproval(
+	async #showCollabAwareApproval(
 		prompt: ExtensionApprovalPrompt,
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionApprovalAnswer> {
@@ -724,7 +896,10 @@ export class ExtensionUiController {
 		const session = this.ctx.session;
 		const agent = session.agent;
 		const pendingSteering = agent.peekSteeringQueue();
-		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return "deny";
+		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) {
+			if (dialogOptions?.signal) this.#nativeLocalSettlers.get(dialogOptions.signal)?.(undefined);
+			return "deny";
+		}
 		this.#denyingSteering = undefined;
 		const steered = new AbortController();
 		let steeringBaseline = session.getQueuedMessages().steering.length;
@@ -745,6 +920,7 @@ export class ExtensionUiController {
 			}
 		});
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
+		this.#inheritNativeSignal(dialogOptions?.signal, signal);
 		try {
 			const choice = await this.#raceCollabDialog(request, signal, localSignal =>
 				this.#presentDialog(localSignal, settle => {
@@ -800,7 +976,7 @@ export class ExtensionUiController {
 		}
 	}
 
-	async showAskDialog(
+	async #showAskDialog(
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
@@ -814,7 +990,10 @@ export class ExtensionUiController {
 		const localAbort = new AbortController();
 		const remoteAbort = new AbortController();
 		const parentSignal = dialogOptions?.signal;
-		const localSignal = parentSignal ? AbortSignal.any([parentSignal, localAbort.signal]) : localAbort.signal;
+		const localSignal = this.#inheritNativeSignal(
+			parentSignal,
+			parentSignal ? AbortSignal.any([parentSignal, localAbort.signal]) : localAbort.signal,
+		);
 		const remoteSignal = parentSignal ? AbortSignal.any([parentSignal, remoteAbort.signal]) : remoteAbort.signal;
 		const localWinner = this.#showLocalAskDialog(normalized, { ...dialogOptions, signal: localSignal }).then(
 			(value): CollabAskDialogWinner => ({ source: "local", value }),
@@ -823,8 +1002,10 @@ export class ExtensionUiController {
 			result => (result === "unavailable" ? localWinner : { source: "remote", value: result }),
 		);
 		const winner = await Promise.race([localWinner, remoteWinner]);
-		if (winner.source === "remote") localAbort.abort();
-		else remoteAbort.abort();
+		if (winner.source === "remote") {
+			if (parentSignal) this.#nativeLocalSettlers.get(parentSignal)?.(winner.value);
+			localAbort.abort();
+		} else remoteAbort.abort();
 		return winner.value;
 	}
 
@@ -983,15 +1164,19 @@ export class ExtensionUiController {
 			{ retainOnReconnect: true },
 		);
 		if (!remote) return local(signal);
-		const localWinner = local(signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal).then(
-			(value): CollabDialogWinner => ({ source: "local", value }),
+		const localSignal = this.#inheritNativeSignal(
+			signal,
+			signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal,
 		);
+		const localWinner = local(localSignal).then((value): CollabDialogWinner => ({ source: "local", value }));
 		const remoteWinner: Promise<CollabDialogWinner> = remote.then(result =>
 			result.kind === "answered" ? { source: "remote", value: result.value } : localWinner,
 		);
 		const winner = await Promise.race([localWinner, remoteWinner]);
-		if (winner.source === "remote") localAbort.abort();
-		else remoteAbort.abort();
+		if (winner.source === "remote") {
+			if (signal) this.#nativeLocalSettlers.get(signal)?.(winner.value);
+			localAbort.abort();
+		} else remoteAbort.abort();
 		return winner.value;
 	}
 
@@ -1152,7 +1337,7 @@ export class ExtensionUiController {
 	/**
 	 * Show a selector for hooks.
 	 */
-	showHookSelector(
+	#showHookSelector(
 		title: string,
 		options: ExtensionUISelectItem[],
 		dialogOptions?: InteractiveSelectorDialogOptions,
@@ -1223,14 +1408,22 @@ export class ExtensionUiController {
 		message: string,
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<boolean> {
-		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
-		return result === "Yes";
+		return this.#nativeDialog(
+			{ kind: "confirm", title, message },
+			dialogOptions,
+			async signal =>
+				(await this.#showHookSelector(`${title}\n${message}`, ["Yes", "No"], { ...dialogOptions, signal })) ===
+				"Yes",
+			nativeConfirmResponse,
+			false,
+			value => value === "Yes",
+		);
 	}
 
 	/**
 	 * Show a text input for hooks.
 	 */
-	showHookInput(
+	#showHookInput(
 		title: string,
 		placeholder?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
@@ -1271,7 +1464,7 @@ export class ExtensionUiController {
 	/**
 	 * Show a multi-line editor for hooks (with Ctrl+G support).
 	 */
-	showHookEditor(
+	#showHookEditor(
 		title: string,
 		prefill?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
@@ -1567,6 +1760,7 @@ export class ExtensionUiController {
 			if (settled) return;
 			settled = true;
 			signal?.removeEventListener("abort", onAbort);
+			if (signal) this.#nativeLocalSettlers.get(signal)?.(value);
 			if (started) {
 				hide?.();
 				this.#dialogActive = false;
@@ -1595,7 +1789,7 @@ export class ExtensionUiController {
 		};
 
 		if (signal?.aborted) {
-			resolve(undefined);
+			settle(undefined);
 			return promise;
 		}
 		signal?.addEventListener("abort", onAbort, { once: true });

@@ -32,6 +32,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { NativeInteractionBroker } from "@oh-my-pi/pi-coding-agent/session/user-interactions";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 import { instrumentRelay, waitFor } from "./helpers/throttled-host";
 
@@ -467,6 +468,10 @@ function makeHostContext(): InteractiveModeContext {
 			onEntryAppended: undefined,
 		},
 		session: {
+			userInteractions: new NativeInteractionBroker(
+				() => "sess-proto",
+				() => ({}),
+			),
 			isStreaming: false,
 			queuedMessageCount: 0,
 			sessionName: "proto test",

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Extensions and SDK hosts can list and answer real native TUI questions, approvals, plan reviews, and settings confirmations through `userInteractions`, with session-bound responses and idempotent delivery receipts ([#2](https://github.com/changeroa/oh-my-pi/pull/2) by [@changeroa](https://github.com/changeroa)).
 - Extensions in the main TUI can hold execution until owned work settles and release admission without replaying queued work.
 
 - Added an opt-in Harness Runtime extension and isolated launcher for validating OMP alongside Codex.
@@ -14,6 +15,7 @@
 
 ### Fixed
 
+- Remote plan approvals and saves use exactly the reviewed snapshot without replacing newer local drafts; native interaction provenance ignores quoted/internal operation markers, and plan decisions reject feedback outside refinement ([#2](https://github.com/changeroa/oh-my-pi/pull/2) by [@changeroa](https://github.com/changeroa)).
 - `omp -p` text mode now prints each automatic retry with its error (for example "Couldn't reach api.anthropic.com … check your network") instead of showing only `Working...` while a turn retries ([#17529](https://github.com/can1357/oh-my-pi/pull/17529) by [@Mannan-Goyal](https://github.com/Mannan-Goyal))
 
 ## [18.15.0] - 2026-11-01

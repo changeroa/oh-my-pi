@@ -145,6 +145,12 @@ import type {
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
 import type { TerminalLaunchRequest, TerminalLaunchResult } from "../../subprocess/terminal-launch";
+import type {
+	NativeUserInteractions,
+	UserInteractionRequestedEvent,
+	UserInteractionResolvedEvent,
+} from "../../session/user-interactions";
+export * from "../../session/user-interactions";
 
 export type { OverlayHandle, OverlayOptions } from "@oh-my-pi/pi-tui";
 export type { AppKeybinding, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
@@ -275,6 +281,8 @@ export type AutocompleteProviderFactory = (current: AutocompleteProvider) => Aut
 export interface ExtensionApprovalPrompt {
 	full: string;
 	compact: string;
+	/** Native call identity, when this prompt gates a tool execution. */
+	toolCallId?: string;
 	/** Label of the "approve for this session" choice; absent when the call must be approved each time. */
 	session?: string;
 	/**
@@ -759,6 +767,8 @@ export interface ExtensionExecutionHold {
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
+	/** Real pending native decisions; responses never submit a model turn. */
+	userInteractions: NativeUserInteractions;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
 	/** Get current context usage for the active model. */
@@ -792,15 +802,16 @@ export interface ExtensionContext {
 	/**
 	 * Answer the open interactive plan review as if the operator picked `choice` in it.
 	 * `refine` needs non-empty `input.feedback`, which is sent as the next planning prompt.
-	 * `save` writes the plan under its default file name without the path prompt.
-	 * Approvals execute the plan as it is when picked (in-overlay edits, else the plan
-	 * file), which may differ from the `planContent` that `plan_review_requested` reported.
+	 * `save` writes the reported snapshot under its default file name without the path
+	 * prompt, refusing to replace an existing file. Approvals execute exactly the
+	 * reported `planContent` using a separate durable plan reference, preserving newer
+	 * local draft edits. Local picks still use the live overlay/file contents.
 	 * `input.role` selects an approval's execution tier, matched against `plan_review_requested`'s
 	 * `tiers` by role name; without it the approval runs on the tier selected in the
 	 * overlay's model slider. `role` applies only to approvals (`execute`, `compact`, `keep`).
 	 * False when that review is not open, the choice is disabled or missing its feedback,
-	 * `input.role` names no selectable tier or accompanies a non-approval choice, or the
-	 * mode has no plan review.
+	 * meaningful feedback accompanies a non-refine choice, `input.role` names no
+	 * selectable tier or accompanies a non-approval choice, or the mode has no plan review.
 	 */
 	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
 	/**
@@ -1692,6 +1703,8 @@ export type ExtensionEvent =
 	| ToolApprovalResolvedEvent
 	| PlanReviewRequestedEvent
 	| PlanReviewResolvedEvent
+	| UserInteractionRequestedEvent
+	| UserInteractionResolvedEvent
 	| ModeChangedEvent;
 
 // ============================================================================
@@ -1897,6 +1910,8 @@ export interface ExtensionAPI {
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
 	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
 	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
+	on(event: "user_interaction_requested", handler: ExtensionHandler<UserInteractionRequestedEvent>): void;
+	on(event: "user_interaction_resolved", handler: ExtensionHandler<UserInteractionResolvedEvent>): void;
 	on(event: "mode_changed", handler: ExtensionHandler<ModeChangedEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;

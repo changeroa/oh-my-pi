@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
+import { NativeInteractionBroker } from "./user-interactions";
 
 import {
 	type AfterToolCallContext,
@@ -907,6 +908,32 @@ function todoRetryMatches(failed: Record<string, unknown>, retry: Record<string,
 }
 
 export class AgentSession implements SettingsScope {
+	readonly userInteractions = new NativeInteractionBroker(
+		() => this.sessionManager.getSessionId(),
+		() => {
+			const entries = this.sessionManager.getBranchView();
+			for (let index = entries.length - 1; index >= 0; index--) {
+				const entry = entries[index];
+				if (entry.type !== "message" || entry.message.role !== "user" || entry.message.synthetic) continue;
+				const content = entry.message.content;
+				const text =
+					typeof content === "string"
+						? content
+						: content
+								.filter(block => block.type === "text")
+								.map(block => block.text)
+								.join("\n");
+				return {
+					sourceEntryId: entry.id,
+					sourceOperationHash: text.match(/(?:^|\n)\[DORI_OPERATION:([0-9a-fA-F]{64})\][ \t]*(?:\r?\n)?$/)?.[1],
+				};
+			}
+			return {};
+		},
+		event => {
+			void this.extensionRunner?.emit(event);
+		},
+	);
 	#executionHoldState: ExecutionHoldState | undefined;
 	#executionHoldWork: Promise<ExecutionHoldState> | undefined;
 	#executionHoldCancellation = new AbortController();
@@ -2250,6 +2277,7 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		if (this.#extensionRunner) this.#extensionRunner.userInteractions = this.userInteractions;
 		this.#extensionRunner?.setExecutionAdmissionGuard?.(() => this.#assertExecutionAllowed());
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
@@ -6347,6 +6375,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.userInteractions.invalidate(true);
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
@@ -9292,6 +9321,7 @@ export class AgentSession implements SettingsScope {
 
 		return {
 			ui: noOpUIContext,
+			userInteractions: this.userInteractions,
 			mode: "print",
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
@@ -11584,6 +11614,7 @@ export class AgentSession implements SettingsScope {
 		}
 
 		this.#disconnectFromAgent();
+		this.userInteractions.invalidate();
 		let advisorRecordersDetached = false;
 		await this.abort();
 		this.#cancelOwnAsyncJobs();
@@ -11769,6 +11800,7 @@ export class AgentSession implements SettingsScope {
 				// No file means fork() is a no-op. Otherwise invalidate admitted
 				// prompt setup before the asynchronous identity rewrite begins.
 				if (previousSessionFile) this.#promptGeneration++;
+				if (previousSessionFile) this.userInteractions.invalidate();
 				forkResult = await this.sessionManager.fork();
 			} catch (error) {
 				this.#bash.finishSessionTransition(bashTransition, false);
@@ -13322,6 +13354,7 @@ export class AgentSession implements SettingsScope {
 		}
 
 		this.#disconnectFromAgent();
+		this.userInteractions.invalidate();
 		await this.abort({ goalReason: "internal" });
 		await this.#sessionBeforeSwitchReconciler?.();
 
@@ -13812,6 +13845,7 @@ export class AgentSession implements SettingsScope {
 				// A prompt admitted during the drain awaits above belongs to the history
 				// being replaced; the generation bump drops its pending setup.
 				this.#promptGeneration++;
+				this.userInteractions.invalidate();
 				if (!leafId) {
 					const title = this.sessionManager.getSessionName();
 					const titleSource = this.sessionManager.titleSource;
@@ -13940,6 +13974,7 @@ export class AgentSession implements SettingsScope {
 				// A prompt may have been admitted during the flush/drain awaits
 				// after the idle check. It still belongs to the pre-branch context.
 				this.#promptGeneration++;
+				this.userInteractions.invalidate();
 				this.sessionManager.createBranchedSession(leafId);
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
@@ -14192,6 +14227,7 @@ export class AgentSession implements SettingsScope {
 		// All cancellation/no-op exits are behind us. Invalidate prompt setup
 		// admitted on the abandoned branch before committing any tree changes.
 		this.#promptGeneration++;
+		this.userInteractions.invalidate();
 
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;

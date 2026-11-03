@@ -5,6 +5,9 @@ Use it when you want direct access to agent state, event streaming, tool wiring,
 
 If you need cross-language/process isolation, use RPC mode instead.
 
+Native interactive hosts expose `session.userInteractions` and the same `ctx.userInteractions` extension facade. `list()` snapshots real pending TUI decisions; `respond(requestId, response, operationId)` settles the existing dialog without a new prompt/model turn; `responseStatus(operationId)` reconciles uncertain delivery. The public `NativeUserInteraction`, `NativeUserInteractionResponse`, `NativeInteractionReceipt`, `NativeInteractionStatus`, and `NativeUserInteractions` types are exported from the package root and the extensions type surface. See [Native user interactions](extensions.md#native-user-interactions) for response shapes, lifecycle events, scope validation, secret-input restrictions, and receipt retention. RPC/ACP retain their existing UI transports; custom visual components are not generic remote dialogs.
+
+
 ## Installation
 
 ```bash
