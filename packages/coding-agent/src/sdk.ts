@@ -4765,7 +4765,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				: new CacheWarmer({
 						stream: (model, context, streamOptions) => primaryStreamFn(model, context, streamOptions),
 						getPromptTokens: () => session.lastPromptTokens(),
-						getMode: () => session?.isExecutionHeld ? "off" : cfgProvidersCacheWarming.get(settings),
+						getMode: () => (session?.isExecutionHeld ? "off" : cfgProvidersCacheWarming.get(settings)),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {

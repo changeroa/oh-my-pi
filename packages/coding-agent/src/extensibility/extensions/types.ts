@@ -781,9 +781,17 @@ export interface ExtensionExecutionHold {
 	 */
 	tryHoldForRestart(operationId: string, authorizationHash: string): Promise<ExecutionHoldState | null>;
 	/** Append a real user entry without inference while the restart latch remains held. */
-	stageRestartContinuation(operationId: string, authorizationHash: string, text: string): Promise<{ entryId: string; textHash: string }>;
+	stageRestartContinuation(
+		operationId: string,
+		authorizationHash: string,
+		text: string,
+	): Promise<{ entryId: string; textHash: string }>;
 	/** Opens only this latch and synchronously claims the staged continuation before yielding. */
-	releaseRestartContinuation(operationId: string, authorizationHash: string, expected: ExecutionHoldState): Promise<ExecutionHoldState>;
+	releaseRestartContinuation(
+		operationId: string,
+		authorizationHash: string,
+		expected: ExecutionHoldState,
+	): Promise<ExecutionHoldState>;
 	release(expected: { sessionId: string; generation: number }): Promise<ExecutionHoldState>;
 }
 

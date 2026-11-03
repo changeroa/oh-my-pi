@@ -21,13 +21,20 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(responses: MockResponseSource = [{ content: ["done"] }], manager?: AsyncJobManager, sessionManager = SessionManager.inMemory(), startExecutionHeld = false,
-	profile: { settings?: Settings; agentDir?: string; autoApprove?: boolean } = {}) {
+function harness(
+	responses: MockResponseSource = [{ content: ["done"] }],
+	manager?: AsyncJobManager,
+	sessionManager = SessionManager.inMemory(),
+	startExecutionHeld = false,
+	profile: { settings?: Settings; agentDir?: string; autoApprove?: boolean } = {},
+) {
 	const auth = createInMemoryAuthStorage();
 	cleanups.push(() => auth.close());
 	auth.keys.setRuntime("anthropic", "test-key");
 	const provider = createMockModel({ responses });
-	const settings = profile.settings ?? Settings.isolated({ "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false });
+	const settings =
+		profile.settings ??
+		Settings.isolated({ "compaction.enabled": false, "retry.enabled": false, "todo.enabled": false });
 	const session = new AgentSession({
 		agent: new Agent({
 			getApiKey: () => "test-key",
@@ -37,7 +44,9 @@ function harness(responses: MockResponseSource = [{ content: ["done"] }], manage
 		}),
 		sessionManager,
 		startExecutionHeld,
-		settings, agentDir: profile.agentDir, autoApprove: profile.autoApprove,
+		settings,
+		agentDir: profile.agentDir,
+		autoApprove: profile.autoApprove,
 		modelRegistry: new ModelRegistry(auth),
 		agentId: "hold-owner",
 		asyncJobManager: manager,
@@ -318,26 +327,43 @@ describe("owner restart native admission", () => {
 		cleanups.push(() => temp.removeSync());
 		const directory = fs.realpathSync(temp.path());
 		let aborted = false;
-		const { session, provider } = harness([
-			{ content: [{ type: "toolCall", id: "restart-wait", name: "wait", arguments: {} }] },
-			{ content: ["finished naturally"] },
-		], undefined, SessionManager.create(directory, directory));
-		session.agent.setTools([{
-			name: "wait", label: "Wait", description: "Wait", parameters: type({}),
-			async execute(_id, _params, signal) {
-				signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
-				entered.resolve();
-				await finish.promise;
-				return { content: [{ type: "text", text: "finished" }] };
+		const { session, provider } = harness(
+			[
+				{ content: [{ type: "toolCall", id: "restart-wait", name: "wait", arguments: {} }] },
+				{ content: ["finished naturally"] },
+			],
+			undefined,
+			SessionManager.create(directory, directory),
+		);
+		session.agent.setTools([
+			{
+				name: "wait",
+				label: "Wait",
+				description: "Wait",
+				parameters: type({}),
+				async execute(_id, _params, signal) {
+					signal?.addEventListener(
+						"abort",
+						() => {
+							aborted = true;
+						},
+						{ once: true },
+					);
+					entered.resolve();
+					await finish.promise;
+					return { content: [{ type: "text", text: "finished" }] };
+				},
 			},
-		}]);
+		]);
 		const running = session.prompt("finish this turn");
 		await entered.promise;
 		try {
 			expect(await session.executionHold.tryHoldForRestart("restart", authorizationHash)).toBeNull();
 			expect(session.executionHold.getState().status).toBe("open");
 			expect(aborted).toBe(false);
-		} finally { finish.resolve(); }
+		} finally {
+			finish.resolve();
+		}
 		await running;
 		expect(provider.calls).toHaveLength(2);
 		expect(aborted).toBe(false);
@@ -358,13 +384,27 @@ describe("owner restart native admission", () => {
 		expect(held?.status).toBe("held");
 		expect(session.agent.peekFollowUpQueue()).toEqual([queued]);
 		await expect(session.prompt("must remain fenced")).rejects.toThrow("held");
-		await expect(session.deliverIrcMessage({ id: "late-peer", from: "peer", to: "hold-owner", body: "must not be accepted", ts: Date.now() })).rejects.toThrow("before acceptance");
+		await expect(
+			session.deliverIrcMessage({
+				id: "late-peer",
+				from: "peer",
+				to: "hold-owner",
+				body: "must not be accepted",
+				ts: Date.now(),
+			}),
+		).rejects.toThrow("before acceptance");
 		const rows = Bun.JSONL.parse(await Bun.file(manager.getSessionFile()!).text()) as Array<Record<string, unknown>>;
 		const parked = rows.find(row => row.type === "custom" && row.customType === "owner-restart-parked-input");
-		expect(parked?.data).toMatchObject({ operationId: "park", disposition: "parked-not-replayed", followUp: [queued] });
+		expect(parked?.data).toMatchObject({
+			operationId: "park",
+			disposition: "parked-not-replayed",
+			followUp: [queued],
+		});
 		expect(rows.filter(row => row.type === "message")).toEqual([]);
 		expect(provider.calls).toHaveLength(0);
-		await expect(Promise.resolve().then(() => session.executionHold.tryHoldForRestart("different", authorizationHash))).rejects.toThrow("conflicts");
+		await expect(
+			Promise.resolve().then(() => session.executionHold.tryHoldForRestart("different", authorizationHash)),
+		).rejects.toThrow("conflicts");
 	});
 
 	it("stages one durable user entry while held and claims exactly that continuation on release", async () => {
@@ -379,14 +419,27 @@ describe("owner restart native admission", () => {
 		if (!held) throw new Error("Fixture did not acquire native latch");
 		expect(held.generation).toBe(1);
 		expect(session.executionHold.isRestartStartupHeld()).toBe(false);
-		const staged = await session.executionHold.stageRestartContinuation("continue", authorizationHash, "service continuation");
-		expect(await session.executionHold.stageRestartContinuation("continue", authorizationHash, "service continuation")).toEqual(staged);
+		const staged = await session.executionHold.stageRestartContinuation(
+			"continue",
+			authorizationHash,
+			"service continuation",
+		);
+		expect(
+			await session.executionHold.stageRestartContinuation("continue", authorizationHash, "service continuation"),
+		).toEqual(staged);
 		const rows = Bun.JSONL.parse(await Bun.file(manager.getSessionFile()!).text()) as Array<Record<string, unknown>>;
-		expect(rows.find(row => row.id === staged.entryId)).toMatchObject({ type: "message", message: { role: "user", content: [{ type: "text", text: "service continuation" }] } });
+		expect(rows.find(row => row.id === staged.entryId)).toMatchObject({
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "service continuation" }] },
+		});
 		expect(session.executionHold.getState().status).toBe("held");
 		expect(provider.calls).toHaveLength(0);
 		await expect(session.prompt("racing local input")).rejects.toThrow("held");
-		await expect(Promise.resolve().then(() => session.executionHold.stageRestartContinuation("continue", authorizationHash, "changed"))).rejects.toThrow("conflict");
+		await expect(
+			Promise.resolve().then(() =>
+				session.executionHold.stageRestartContinuation("continue", authorizationHash, "changed"),
+			),
+		).rejects.toThrow("conflict");
 		await session.executionHold.releaseRestartContinuation("continue", authorizationHash, held);
 		await session.executionHold.releaseRestartContinuation("continue", authorizationHash, held);
 		await session.waitForIdle();
@@ -396,7 +449,9 @@ describe("owner restart native admission", () => {
 
 	it("does not cancel a suppressed background job to manufacture idle", async () => {
 		const manager = new AsyncJobManager({});
-		cleanups.push(() => manager.dispose());
+		cleanups.push(async () => {
+			await manager.dispose();
+		});
 		const { session } = harness(undefined, manager);
 		const finish = Promise.withResolvers<string>();
 		const id = manager.register("bash", "still owned", () => finish.promise, { ownerId: "hold-owner" });
@@ -405,7 +460,9 @@ describe("owner restart native admission", () => {
 			expect(await session.executionHold.tryHoldForRestart("wait-background", authorizationHash)).toBeNull();
 			expect(manager.getJob(id)?.abortController.signal.aborted).toBe(false);
 			expect(session.executionHold.getState().status).toBe("open");
-		} finally { finish.resolve("finished naturally"); }
+		} finally {
+			finish.resolve("finished naturally");
+		}
 		await manager.waitForOwnerJobs("hold-owner");
 	});
 });
@@ -422,10 +479,16 @@ it("a native restart persistence failure retains pending input and permanently f
 	const authorizationHash = "a".repeat(64);
 	const holding = session.executionHold.tryHoldForRestart("disk-failure", authorizationHash);
 	await expect(holding).rejects.toThrow("disk flush failed");
-	await expect(session.executionHold.tryHoldForRestart("disk-failure", authorizationHash)).rejects.toThrow("disk flush failed");
+	await expect(session.executionHold.tryHoldForRestart("disk-failure", authorizationHash)).rejects.toThrow(
+		"disk flush failed",
+	);
 	expect(session.executionHold.getState().status).toBe("holding");
 	expect(session.agent.peekFollowUpQueue()).toEqual([queued]);
-	expect(manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "owner-restart-parked-input")).toHaveLength(1);
+	expect(
+		manager
+			.getEntries()
+			.filter(entry => entry.type === "custom" && entry.customType === "owner-restart-parked-input"),
+	).toHaveLength(1);
 	await expect(session.prompt("must not bypass failed persistence")).rejects.toThrow("held");
 	expect(provider.calls).toHaveLength(0);
 });
@@ -433,30 +496,48 @@ it("a native restart persistence failure retains pending input and permanently f
 it("effective launch metadata uses session settings and native auto-approve precedence without exposing contents", () => {
 	const settings = Settings.isolated({ "tools.approvalMode": "always-ask", "tools.approval": { bash: "deny" } });
 	vi.spyOn(settings, "getAgentDir").mockReturnValue("/fixture/actual-settings");
-	const { session } = harness(undefined, undefined, undefined, false,
-		{ settings, agentDir: "/fixture/actual-agent", autoApprove: true });
+	const { session } = harness(undefined, undefined, undefined, false, {
+		settings,
+		agentDir: "/fixture/actual-agent",
+		autoApprove: true,
+	});
 	const metadata = session.executionHold.getLaunchMetadata();
 	expect(metadata.approvalMode).toBe("yolo");
 	expect(metadata.agentDir).toBe("/fixture/actual-agent");
 	expect(metadata.settingsHome).toBe("/fixture/actual-settings");
-	expect(Object.keys(metadata).sort()).toEqual(["agentDir", "approvalMode", "effort", "model", "provider", "settingsHome"]);
+	expect(Object.keys(metadata).sort()).toEqual([
+		"agentDir",
+		"approvalMode",
+		"effort",
+		"model",
+		"provider",
+		"settingsHome",
+	]);
 });
 
 it("native launch metadata follows live approval changes and fences staged inference on profile drift", async () => {
 	const temp = TempDir.createSync("@omp-restart-profile-");
 	cleanups.push(() => temp.removeSync());
 	const directory = fs.realpathSync(temp.path());
-	const settings = Settings.isolated({ "tools.approvalMode": "yolo", "compaction.enabled": false, "todo.enabled": false });
+	const settings = Settings.isolated({
+		"tools.approvalMode": "yolo",
+		"compaction.enabled": false,
+		"todo.enabled": false,
+	});
 	vi.spyOn(settings, "getAgentDir").mockReturnValue(directory);
-	const { session, provider } = harness(undefined, undefined, SessionManager.create(directory, directory), true,
-		{ settings, agentDir: directory });
+	const { session, provider } = harness(undefined, undefined, SessionManager.create(directory, directory), true, {
+		settings,
+		agentDir: directory,
+	});
 	const hash = "a".repeat(64);
 	const held = await session.executionHold.tryHoldForRestart("profile", hash);
 	if (!held) throw new Error("Fixture did not latch");
 	await session.executionHold.stageRestartContinuation("profile", hash, "bound continuation");
 	cfgToolsApprovalMode.override(settings, "always-ask-cached");
 	expect(session.executionHold.getLaunchMetadata().approvalMode).toBe("always-ask-cached");
-	await expect(session.executionHold.releaseRestartContinuation("profile", hash, held)).rejects.toThrow("launch profile changed");
+	await expect(session.executionHold.releaseRestartContinuation("profile", hash, held)).rejects.toThrow(
+		"launch profile changed",
+	);
 	expect(session.executionHold.getState().status).toBe("held");
 	expect(provider.calls).toHaveLength(0);
 });

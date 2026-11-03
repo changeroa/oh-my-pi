@@ -5,10 +5,19 @@ import { parseArgs } from "../src/cli/args";
 describe("owner restart structured startup arguments", () => {
 	it("extracts isolated settings and bootstrap before native launch parsing without introducing a prompt", () => {
 		const extracted = extractProfileFlags([
-			"--agent-dir", "/private/settings", "--iyen-omp-bootstrap", "/private/restart.json",
-			"--model", "fixture/exact-model", "--thinking", "medium", "--approval-mode", "yolo",
+			"--agent-dir",
+			"/private/settings",
+			"--iyen-omp-bootstrap",
+			"/private/restart.json",
+			"--model",
+			"fixture/exact-model",
+			"--thinking",
+			"medium",
+			"--approval-mode",
+			"yolo",
 			"--start-held",
-			"--resume", "/private/exact-session.jsonl",
+			"--resume",
+			"/private/exact-session.jsonl",
 		]);
 		expect(extracted.agentDir).toBe("/private/settings");
 		expect(extracted.iyenOmpBootstrap).toBe("/private/restart.json");
@@ -35,14 +44,23 @@ describe("owner restart structured startup arguments", () => {
 	it("refuses ambiguous settings, relative paths and conflicting private bootstrap targets", () => {
 		expect(() => extractProfileFlags(["--agent-dir", "relative"])).toThrow("absolute");
 		expect(() => extractProfileFlags(["--iyen-omp-bootstrap", "relative"])).toThrow("absolute");
-		expect(() => extractProfileFlags(["--agent-dir", "/settings", "--profile", "other"])).toThrow("cannot be combined");
-		expect(() => extractProfileFlags(["--agent-dir", "/settings", "--agent-dir", "/replacement"])).toThrow("Conflicting");
-		expect(() => extractProfileFlags(["--iyen-omp-bootstrap=/one", "--iyen-omp-bootstrap=/two"])).toThrow("Conflicting");
+		expect(() => extractProfileFlags(["--agent-dir", "/settings", "--profile", "other"])).toThrow(
+			"cannot be combined",
+		);
+		expect(() => extractProfileFlags(["--agent-dir", "/settings", "--agent-dir", "/replacement"])).toThrow(
+			"Conflicting",
+		);
+		expect(() => extractProfileFlags(["--iyen-omp-bootstrap=/one", "--iyen-omp-bootstrap=/two"])).toThrow(
+			"Conflicting",
+		);
 	});
 });
 
 it("an extension cannot shadow the native constructor-time execution fence", () => {
-	const launch = parseArgs(["--start-held", "--resume", "/private/exact.jsonl"], new Map([["start-held", { type: "string" }]]));
+	const launch = parseArgs(
+		["--start-held", "--resume", "/private/exact.jsonl"],
+		new Map([["start-held", { type: "string" }]]),
+	);
 	expect(launch.startHeld).toBe(true);
 	expect(launch.resume).toBe("/private/exact.jsonl");
 	expect(launch.messages).toEqual([]);

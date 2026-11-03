@@ -124,7 +124,8 @@ export function extractProfileFlags(argv: readonly string[]): ProfileBootstrapRe
 			const value = arg === "--iyen-omp-bootstrap" ? argv[++index] : arg.slice("--iyen-omp-bootstrap=".length);
 			if (!value || !value.startsWith("/") || value.includes("\0"))
 				throw new Error("--iyen-omp-bootstrap requires an absolute private bootstrap file");
-			if (iyenOmpBootstrap !== undefined && iyenOmpBootstrap !== value) throw new Error("Conflicting Iyen bootstrap flags");
+			if (iyenOmpBootstrap !== undefined && iyenOmpBootstrap !== value)
+				throw new Error("Conflicting Iyen bootstrap flags");
 			iyenOmpBootstrap = value;
 			insertBoundaryBeforeNextValue = needsBoundaryAfterGlobalStrip(stripped);
 			continue;
@@ -251,7 +252,10 @@ export function extractProfileFlags(argv: readonly string[]): ProfileBootstrapRe
 
 	if (agentDir !== undefined && (profile !== undefined || aliasName !== undefined))
 		throw new Error("--agent-dir cannot be combined with --profile or --alias");
-	return { argv: stripped, profile, aliasName,
+	return {
+		argv: stripped,
+		profile,
+		aliasName,
 		...(agentDir === undefined ? {} : { agentDir }),
 		...(iyenOmpBootstrap === undefined ? {} : { iyenOmpBootstrap }),
 	};
